@@ -6,9 +6,9 @@
 
 /**
  * @brief Search for whether haystack contains needle.
- * 
+ *
  * Both strings must be C-strings.
  */
-bool ssearch(const char* haystack, size_t haystack_sz, const char* needle);
+bool ssearch(const char *haystack, size_t haystack_sz, const char *needle);
 
 #endif // STRING_SEARCH_H
