@@ -9,13 +9,11 @@
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 static pthread_mutex_t exit_mutex;
 
-void sys_global_init(void) {
-  pthread_mutex_init(&exit_mutex, NULL);
-}
+void sys_global_init(void) { pthread_mutex_init(&exit_mutex, NULL); }
 
 size_t sys_get_avail_cores(void) { return sysconf(_SC_NPROCESSORS_ONLN); }
 
-void sys_panic(int errno, const char* msgfmt, ...) {
+void sys_panic(int errno, const char *msgfmt, ...) {
   pthread_mutex_lock(&exit_mutex);
 
   va_list args;

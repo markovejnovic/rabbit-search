@@ -4,9 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-process_file_job_t process_file_job_new(const char *file_data,
-                                              size_t file_sz,
-                                              const char *file_path) {
+process_file_job_t process_file_job_new(const char *file_data, size_t file_sz,
+                                        const char *file_path) {
   const process_file_job_t out = malloc(sizeof(struct process_file_job));
   out->file_data = file_data;
   out->file_sz = file_sz;
@@ -59,11 +58,9 @@ void jobq_submit(jobq queue, const_process_file_job_t job) {
   LOG_DEBUG_FMT("jobq_submit: %s", job->file_path);
   // TODO(mvejnovic): This being seq_cst is very slow.
   atomic_fetch_add_explicit(
-    &queue->reserved_bytes,
-    // TODO(mvejnovic) v- This cast is a bug waiting to happen.
-    (ssize_t)job->file_sz,
-    memory_order_seq_cst
-  );
+      &queue->reserved_bytes,
+      // TODO(mvejnovic) v- This cast is a bug waiting to happen.
+      (ssize_t)job->file_sz, memory_order_seq_cst);
   jobq_node *new_node = malloc(sizeof(jobq_node));
   new_node->data = job;
 
@@ -102,11 +99,9 @@ process_file_job_t jobq_retrieve(jobq queue) {
   free(old_head);
   // TODO(mvejnovic): This being seq_cst is very slow.
   atomic_fetch_add_explicit(
-    &queue->reserved_bytes,
-    // TODO(mvejnovic) v- This cast is a bug waiting to happen.
-    -(ssize_t)data_out->file_sz,
-    memory_order_seq_cst
-  );
+      &queue->reserved_bytes,
+      // TODO(mvejnovic) v- This cast is a bug waiting to happen.
+      -(ssize_t)data_out->file_sz, memory_order_seq_cst);
   return data_out;
 }
 
