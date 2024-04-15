@@ -53,11 +53,11 @@ static fs_err enqueue_file(jobq job_queue, const char *file_path) {
   // is a good idea, or whether it's better to have a greedy algorithm
   // that takes a massive malloc buffer.
   if (unlikely(fseek(file, 0L, SEEK_END) != 0)) {
-    sys_panic(2, "Could not seek to the end of the file \"%s\".", file_path); 
+    sys_panic(2, "Could not seek to the end of the file \"%s\".", file_path);
   }
   const size_t file_sz = ftell(file);
   if (unlikely(fseek(file, 0L, SEEK_SET) != 0)) {
-    sys_panic(2, "Could not seek to the start of the file \"%s\".", file_path); 
+    sys_panic(2, "Could not seek to the start of the file \"%s\".", file_path);
   }
 
   // TODO(mvejnovic): This algorithm obviously is limited by the file size.
@@ -75,7 +75,7 @@ static fs_err enqueue_file(jobq job_queue, const char *file_path) {
     (void)snprintf(fs_err_msg_buf_g, sizeof(fs_err_msg_buf_g),
                    "Failed to read: %s.\n", file_path);
     if (unlikely(fclose(file) != 0)) {
-      sys_panic(2, "Could not close \"%s\".", file_path); 
+      sys_panic(2, "Could not close \"%s\".", file_path);
     }
     return (fs_err){
         .err_code = FS_ERR_IO_ERR,
@@ -84,7 +84,7 @@ static fs_err enqueue_file(jobq job_queue, const char *file_path) {
   }
 
   if (unlikely(fclose(file) != 0)) {
-    sys_panic(2, "Could not close \"%s\".", file_path); 
+    sys_panic(2, "Could not close \"%s\".", file_path);
   }
 
   // We have now submitted the file and it is outside of our hands. A
@@ -96,13 +96,13 @@ static fs_err enqueue_file(jobq job_queue, const char *file_path) {
 
 static fs_err enqueue_directory(jobq job_queue, const char *dir_path) {
   size_t dirs_seen = 0;
-  char *directories_in_dir = malloc(
-    (unsigned long)DIRS_PER_DIR_START * NAME_MAX);
+  char *directories_in_dir =
+      malloc((unsigned long)DIRS_PER_DIR_START * NAME_MAX);
 
   DIR *dir_p = opendir(dir_path);
   if (unlikely(!dir_p)) {
     (void)snprintf(fs_err_msg_buf_g, sizeof(fs_err_msg_buf_g),
-             "Failed to open: %s.\n", dir_path);
+                   "Failed to open: %s.\n", dir_path);
     return (fs_err){.err_code = FS_ERR_IO_ERR, .msg = fs_err_msg_buf_g};
   }
 

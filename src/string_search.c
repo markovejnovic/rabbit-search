@@ -36,8 +36,8 @@ void fillGoodSuffixRuleTable(
        - use variable length arrays and >= C99 compilers
        - allocate (and finally release) heap according to demand
     parameters: */
-    size_t aGoodSuffixIndexTable[],
-    char const *const pPattern, size_t const patternLength)
+    size_t aGoodSuffixIndexTable[], char const *const pPattern,
+    size_t const patternLength)
 /*----------------------------------------------------------------*/
 {
   size_t const highestPatternIndex = patternLength - 1;

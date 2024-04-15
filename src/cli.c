@@ -68,7 +68,7 @@ cli_t cli_parse(size_t argc, const char **argv) {
       if (args.search_directory != NULL) {
         // TODO(mvejnovic): Propagate error up.
         sys_panic(1,
-          "Invalid arguments. Cannot search multiple directories.\n");
+                  "Invalid arguments. Cannot search multiple directories.\n");
       }
 
       args.search_directory = argv[i];
