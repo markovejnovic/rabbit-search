@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+// It is safe to ignore these errors as they refer to snprintf.
+// NOLINTBEGIN(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
 
 enum { DIRS_PER_DIR_START = 128 };
 
@@ -42,7 +44,7 @@ static fs_err enqueue_file(jobq job_queue, const char *file_path) {
   FILE *file = fopen(file_path, "r");
 
   if (unlikely(file == NULL)) {
-    (void)snprintf(fs_err_msg_buf_g, sizeof(fs_err_msg_buf_g),
+    (void)snprintf(fs_err_msg_buf_g, sizeof(fs_err_msg_buf_g), 
                    "Failed to open: %s.\n", file_path);
     return (fs_err){.err_code = FS_ERR_IO_ERR, .msg = fs_err_msg_buf_g};
   }
@@ -95,19 +97,21 @@ static fs_err enqueue_file(jobq job_queue, const char *file_path) {
 }
 
 static fs_err enqueue_directory(jobq job_queue, const char *dir_path) {
-  size_t dirs_seen = 0;
-  char *directories_in_dir = malloc(
-    (unsigned long)DIRS_PER_DIR_START * NAME_MAX);
-
   DIR *dir_p = opendir(dir_path);
   if (unlikely(!dir_p)) {
     (void)snprintf(fs_err_msg_buf_g, sizeof(fs_err_msg_buf_g),
-             "Failed to open: %s.\n", dir_path);
+                     "Failed to open: %s.\n", dir_path);
     return (fs_err){.err_code = FS_ERR_IO_ERR, .msg = fs_err_msg_buf_g};
   }
 
-  struct dirent *dirent_p;
+  struct dirent *dirent_p = NULL;
+  char *directories_in_dir = malloc(
+    (unsigned long)DIRS_PER_DIR_START * NAME_MAX);
+  size_t dirs_seen = 0;
+
+  // NOLINTBEGIN(concurrency-mt-unsafe)
   while (likely((dirent_p = readdir(dir_p)) != NULL)) {
+  // NOLINTEND(concurrency-mt-unsafe)
     switch (dirent_p->d_type) {
     case DT_REG: {
       // Regular file should be sent to the job queue.
@@ -142,10 +146,8 @@ static fs_err enqueue_directory(jobq job_queue, const char *dir_path) {
       };
 
     case DT_LNK:
-      // TODO(mvejnovic): Handle symbolic links.
-      break;
-
     default:
+      // TODO(mvejnovic): Handle symbolic links.
       // TODO(mvejnovic): All other things are ignorable, I think.
       break;
     }
@@ -258,3 +260,5 @@ int main(int argc, const char **argv) {
 
   return 0;
 }
+
+// NOLINTEND(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
