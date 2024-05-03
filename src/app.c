@@ -1,4 +1,6 @@
+#define _GNU_SOURCE
 #include "cli.h"
+#include "filters.h"
 #include "job_q.h"
 #include "log.h"
 #include "pathops.h"
@@ -6,11 +8,15 @@
 #include "string_search.h"
 #include "sys.h"
 #include <dirent.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 // It is safe to ignore these errors as they refer to snprintf.
 // NOLINTBEGIN(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
@@ -41,57 +47,45 @@ typedef struct {
  *                       of the string. A corresponding free will be called.
  */
 static fs_err enqueue_file(jobq job_queue, const char *file_path) {
-  FILE *file = fopen(file_path, "r");
+  int file = open(file_path, O_RDONLY);
 
-  if (unlikely(file == NULL)) {
+  if (unlikely(file < 0)) {
     (void)snprintf(fs_err_msg_buf_g, sizeof(fs_err_msg_buf_g), 
                    "Failed to open: %s.\n", file_path);
     return (fs_err){.err_code = FS_ERR_IO_ERR, .msg = fs_err_msg_buf_g};
   }
 
+  // TODO(mvejnovic): Handle the TOCTOU problem. Steal it from ag
+
   // Query the file size and immediately rewind to start of file.
-  // TODO(mvejnovic): It's possible that this is a tad slow.
-  // I wonder if seeking to the end to query the file size so we can malloc
-  // is a good idea, or whether it's better to have a greedy algorithm
-  // that takes a massive malloc buffer.
-  if (unlikely(fseek(file, 0L, SEEK_END) != 0)) {
-    sys_panic(2, "Could not seek to the end of the file \"%s\".", file_path); 
-  }
-  const size_t file_sz = ftell(file);
-  if (unlikely(fseek(file, 0L, SEEK_SET) != 0)) {
-    sys_panic(2, "Could not seek to the start of the file \"%s\".", file_path); 
-  }
+  struct stat file_stats; 
+  if (unlikely(fstat(file, &file_stats))) {
+    close(file);
+    (void)snprintf(fs_err_msg_buf_g, sizeof(fs_err_msg_buf_g),
+                   "Failed to stat: %s.\n", file_path);
+    return (fs_err){
+        .err_code = FS_ERR_IO_ERR,
+        .msg = fs_err_msg_buf_g,
+    };
+  };
 
   // TODO(mvejnovic): This algorithm obviously is limited by the file size.
   // A massive (more than available RAM) file will easily tear your system
   // to shreds.
   // I wonder if that can be remedied by treating said file, for the sake of
   // the job queue, as multiple files with the same name.
-  char *data = malloc(file_sz);
+  char *data = mmap(0, file_stats.st_size, PROT_READ, MAP_PRIVATE, file, 0);
+  // TODO(markovejnovic): Exit on data == NULL
+  madvise(data, file_stats.st_size, MADV_SEQUENTIAL);
   // No need to check if this passed. If it didn't let the program crash.
 
-  // TODO(mvejnovic): Do we care if this fails to load anything?
-  //                  Can't we treat that job as empty and let our search
-  //                  workers figure it out?
-  if (unlikely(fread(data, 1, file_sz, file) != file_sz)) {
-    (void)snprintf(fs_err_msg_buf_g, sizeof(fs_err_msg_buf_g),
-                   "Failed to read: %s.\n", file_path);
-    if (unlikely(fclose(file) != 0)) {
-      sys_panic(2, "Could not close \"%s\".", file_path); 
-    }
-    return (fs_err){
-        .err_code = FS_ERR_IO_ERR,
-        .msg = fs_err_msg_buf_g,
-    };
-  }
-
-  if (unlikely(fclose(file) != 0)) {
+  if (unlikely(close(file) != 0)) {
     sys_panic(2, "Could not close \"%s\".", file_path); 
   }
 
   // We have now submitted the file and it is outside of our hands. A
   // searchrat thread will free it as required.
-  jobq_submit(job_queue, process_file_job_new(data, file_sz, file_path));
+  jobq_submit(job_queue, process_file_job_new(data, file_stats.st_size, file_path));
 
   return (fs_err){.err_code = FS_ERR_OK, .msg = NULL};
 }
@@ -116,10 +110,11 @@ static fs_err enqueue_directory(jobq job_queue, const char *dir_path) {
   while (likely((dirent_p = readdir(dir_p)) != NULL)) {
   // NOLINTEND(concurrency-mt-unsafe)
     switch (dirent_p->d_type) {
+
     case DT_REG: {
       // Regular file should be sent to the job queue.
       const char *f_path = path_mkcat(dir_path, dirent_p->d_name);
-      LOG_DEBUG_FMT("enqueue_directory: %s is a directory.", f_path);
+      LOG_DEBUG_FMT("enqueue_directory: %s is a file.", f_path);
       const fs_err err = enqueue_file(job_queue, f_path);
       if (unlikely(err.err_code != FS_ERR_OK)) {
         closedir(dir_p);
@@ -127,18 +122,30 @@ static fs_err enqueue_directory(jobq job_queue, const char *dir_path) {
       }
       break;
     }
-    case DT_DIR:
+
+    case DT_DIR: {
+#ifdef RABBITSEARCH_LOGS
+      char *f_path = path_mkcat(dir_path, dirent_p->d_name);
+      LOG_DEBUG_FMT("enqueue_directory: %s is a directory.", f_path);
+      free(f_path);
+#endif // RABBITSEARCH_LOGS
       // Directories should be pushed to the directories to traverse
       // in the next run.
-      if (strcmp(dirent_p->d_name, ".") == 0 ||
-          strcmp(dirent_p->d_name, "..") == 0) {
+      if (!filter_directory(dirent_p->d_name)) {
         break;
       }
       strncpy(&directories_in_dir[dirs_seen * NAME_MAX], dirent_p->d_name,
               NAME_MAX);
       dirs_seen++;
       break;
-    case DT_UNKNOWN:
+    }
+
+    case DT_UNKNOWN: {
+#ifdef RABBITSEARCH_LOGS
+      char *f_path = path_mkcat(dir_path, dirent_p->d_name);
+      LOG_DEBUG_FMT("enqueue_directory: %s is an unknown inode.", f_path);
+      free(f_path);
+#endif // RABBITSEARCH_LOGS
       (void)snprintf(fs_err_msg_buf_g, sizeof(fs_err_msg_buf_g),
                      "This filesystem requires a seek to get inode info. "
                      "Currently this filesystem is unsupported.");
@@ -147,8 +154,16 @@ static fs_err enqueue_directory(jobq job_queue, const char *dir_path) {
           .err_code = FS_ERR_UNSUPPORTED_FILESYSTEM,
           .msg = fs_err_msg_buf_g,
       };
+    }
 
-    case DT_LNK:
+    case DT_LNK: {
+#ifdef RABBITSEARCH_LOGS
+      char *f_path = path_mkcat(dir_path, dirent_p->d_name);
+      LOG_DEBUG_FMT("enqueue_directory: %s is a symlink.", f_path);
+      free(f_path);
+#endif // RABBITSEARCH_LOGS
+    }
+
     default:
       // TODO(mvejnovic): Handle symbolic links.
       // TODO(mvejnovic): All other things are ignorable, I think.
@@ -199,7 +214,8 @@ void *read_process(void *arg) {
     }
 
     LOG_DEBUG("read_process: Received work...");
-    if (ssearch(job->file_data, job->file_sz, needle)) {
+    // TODO(markovejnovic): We should not be ignoring large files.
+    if (job->file_sz < 100 * 1024 && ssearch(job->file_data, job->file_sz, needle)) {
       printf("Found: %s\n", job->file_path);
     }
     process_file_job_delete(job);
@@ -210,6 +226,12 @@ void *read_process(void *arg) {
 
 int main(int argc, const char **argv) {
   const cli_t cli_args = cli_parse(argc, argv);
+
+#ifdef HAVE_PLEDGE
+  if (pledge("stdio rpath proc exec", NULL) == -1) {
+      die("pledge: %s", strerror(errno));
+  }
+#endif
 
   if (cli_args.help) {
     cli_help(cli_args);
@@ -242,6 +264,15 @@ int main(int argc, const char **argv) {
     if (pthread_create(&threads[i], NULL, read_process, shared_state) != 0) {
       perror("pthread_create(...) failed to start.");
     }
+
+    cpu_set_t cpu_set;
+    CPU_ZERO(&cpu_set);
+    CPU_SET(i % sys_get_avail_cores(), &cpu_set);
+
+    if (pthread_setaffinity_np(threads[i], sizeof(cpu_set), &cpu_set)) {
+      perror("pthread_setaffinity_np(...) failed to pin CPUs.");
+    }
+
     LOG_DEBUG_FMT("Started thread %lu", i);
   }
 

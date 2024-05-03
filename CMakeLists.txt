@@ -13,6 +13,6 @@ set(C_STANDARD C17)
 
 add_executable(
     rbbs src/app.c src/job_q.c src/pathops.c src/cli.c src/sys.c
-    src/string_search.c
+    src/string_search.c src/filters.c
 )
 target_include_directories(rbbs PRIVATE include)

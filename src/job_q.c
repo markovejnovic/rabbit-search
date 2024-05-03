@@ -3,6 +3,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 
 process_file_job_t process_file_job_new(const char *file_data,
                                               size_t file_sz,
@@ -23,7 +24,7 @@ struct jobq_node {
 };
 
 void process_file_job_delete(const_process_file_job_t job) {
-  free((char *)job->file_data);
+  munmap((void*)job->file_data, job->file_sz);
   free((char*)job->file_path);
   free((process_file_job_t)job);
 }
