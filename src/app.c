@@ -98,6 +98,7 @@ static fs_err enqueue_file(jobq job_queue, const char *file_path) {
 
 static fs_err enqueue_directory(jobq job_queue, const char *dir_path) {
   DIR *dir_p = opendir(dir_path);
+
   if (unlikely(!dir_p)) {
     (void)snprintf(fs_err_msg_buf_g, sizeof(fs_err_msg_buf_g),
                      "Failed to open: %s.\n", dir_path);
@@ -105,6 +106,8 @@ static fs_err enqueue_directory(jobq job_queue, const char *dir_path) {
   }
 
   struct dirent *dirent_p = NULL;
+  // TODO(markovejnovic): This only supports up to DIRS_PER_DIR_START
+  // directories in a folder.
   char *directories_in_dir = malloc(
     (unsigned long)DIRS_PER_DIR_START * NAME_MAX);
   size_t dirs_seen = 0;
@@ -164,6 +167,9 @@ static fs_err enqueue_directory(jobq job_queue, const char *dir_path) {
     free(nested_path);
   }
 
+  free(directories_in_dir);
+
+  closedir(dir_p);
   return (fs_err){.err_code = FS_ERR_OK, .msg = NULL};
 }
 
@@ -180,10 +186,9 @@ void *read_process(void *arg) {
   const jobq queue = shared_state->job_queue;
   const char *needle = shared_state->needle;
 
-  LOG_DEBUG_FMT("read_process: Searching for \"%s\" in %p", needle, queue);
+  LOG_DEBUG_FMT("read_process: Searching for \"%s\" in q: %p", needle, queue);
 
   while (true) {
-    LOG_DEBUG("read_process: Retrieving from queue...");
     const process_file_job_t job = jobq_retrieve(queue);
     if (job == NULL) {
       if (atomic_load_explicit(&shared_state->done_traversing,
@@ -193,6 +198,7 @@ void *read_process(void *arg) {
       continue;
     }
 
+    LOG_DEBUG("read_process: Received work...");
     if (ssearch(job->file_data, job->file_sz, needle)) {
       printf("Found: %s\n", job->file_path);
     }

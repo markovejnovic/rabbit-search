@@ -24,6 +24,7 @@ struct jobq_node {
 
 void process_file_job_delete(const_process_file_job_t job) {
   free((char *)job->file_data);
+  free((char*)job->file_path);
   free((process_file_job_t)job);
 }
 
