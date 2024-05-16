@@ -37,8 +37,6 @@ struct jobq {
   // however, mark it _Atomic
   _Atomic size_t num_submitted;
 #endif
-
-  _Atomic ssize_t reserved_bytes;
 };
 
 jobq jobq_new(void) {
@@ -47,7 +45,6 @@ jobq jobq_new(void) {
 #if RABBITSEARCH_METRICS_ENABLE
   queue->num_submitted = 0;
 #endif
-  atomic_store(&queue->reserved_bytes, 0);
   return queue;
 }
 
@@ -59,13 +56,6 @@ void jobq_delete(jobq queue) {
 
 void jobq_submit(jobq queue, const_process_file_job_t job) {
   LOG_DEBUG_FMT("jobq_submit: %s", job->file_path);
-  // TODO(mvejnovic): This being seq_cst is very slow.
-  atomic_fetch_add_explicit(
-    &queue->reserved_bytes,
-    // TODO(mvejnovic) v- This cast is a bug waiting to happen.
-    (ssize_t)job->file_sz,
-    memory_order_seq_cst
-  );
   jobq_node *new_node = malloc(sizeof(jobq_node));
   new_node->data = job;
 
@@ -102,13 +92,6 @@ process_file_job_t jobq_retrieve(jobq queue) {
 
   const process_file_job_t data_out = old_head->data;
   free(old_head);
-  // TODO(mvejnovic): This being seq_cst is very slow.
-  atomic_fetch_add_explicit(
-    &queue->reserved_bytes,
-    // TODO(mvejnovic) v- This cast is a bug waiting to happen.
-    -(ssize_t)data_out->file_sz,
-    memory_order_seq_cst
-  );
   return data_out;
 }
 
@@ -117,8 +100,3 @@ size_t jobq_get_jobs_submitted_total(jobq queue) {
   return queue->num_submitted;
 }
 #endif
-
-ssize_t jobq_get_bytes_in_use(jobq queue) {
-  // TODO(mvejnovic): This being seq_cst is very slow.
-  return atomic_load_explicit(&queue->reserved_bytes, memory_order_seq_cst);
-}

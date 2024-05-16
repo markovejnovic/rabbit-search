@@ -191,6 +191,7 @@ static fs_err enqueue_directory(jobq job_queue, const char *dir_path) {
 struct shared_state {
   jobq job_queue;
   const char *needle;
+  size_t needle_sz;
   _Atomic bool done_traversing;
 };
 
@@ -200,6 +201,7 @@ void *read_process(void *arg) {
   struct shared_state *shared_state = (struct shared_state *)arg;
   const jobq queue = shared_state->job_queue;
   const char *needle = shared_state->needle;
+  const size_t needle_sz = shared_state->needle_sz;
 
   LOG_DEBUG_FMT("read_process: Searching for \"%s\" in q: %p", needle, queue);
 
@@ -215,7 +217,8 @@ void *read_process(void *arg) {
 
     LOG_DEBUG("read_process: Received work...");
     // TODO(markovejnovic): We should not be ignoring large files.
-    if (job->file_sz < 100 * 1024 && ssearch(job->file_data, job->file_sz, needle)) {
+    if (job->file_sz < 100 * 1024
+        && ssearch(job->file_data, job->file_sz, needle, needle_sz)) {
       printf("Found: %s\n", job->file_path);
     }
     process_file_job_delete(job);
@@ -254,6 +257,7 @@ int main(int argc, const char **argv) {
   struct shared_state *shared_state = malloc(sizeof(struct shared_state));
   shared_state->job_queue = master_job_queue;
   shared_state->needle = cli_args.search_directory;
+  shared_state->needle_sz = strlen(cli_args.search_directory);
   shared_state->done_traversing = false;
 
   pthread_t threads[available_jobs];
