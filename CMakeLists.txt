@@ -27,6 +27,7 @@ CHECK_C_COMPILER_FLAG("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
 if(COMPILER_SUPPORTS_MARCH_NATIVE AND OPTIMIZE_FOR_NATIVE)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=native")
 endif()
+set(CMAKE_CXX_FLAGS_RELEASE "-Ofast")
 
 add_executable(
   rbbs src/app.c src/job_q.c src/pathops.c src/cli.c src/sys.c
