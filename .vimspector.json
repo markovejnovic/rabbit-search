@@ -1,0 +1,20 @@
+{
+  "configurations": {
+    "local-search": {
+      "adapter": "vscode-cpptools",
+      "configuration": {
+        "request": "launch",
+        "program": "${workspaceRoot}/zig-out/bin/rabbit-search",
+        "args": ["Thread", "."],
+        "StopAtEntry": true,
+        "MIMode": "gdb"
+      },
+      "breakpoints": {
+        "exception": {
+          "caught": "",
+          "unchaught": "Y"
+        }
+      }
+    }
+  }
+}
