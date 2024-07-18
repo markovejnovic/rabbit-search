@@ -1,3 +1,5 @@
+# 🚧 This repository is under heavy rewrites (I'm learning zig)
+
 # 🐇 Rabbit Search
 
 ![Dumb Drawing by ChatGPT](./res/banner.webp)
