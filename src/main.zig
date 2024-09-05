@@ -7,6 +7,7 @@ const str = @import("str.zig");
 
 const SearchContext = struct {
     search_needle: []const u8,
+    out_file: std.fs.File,
 };
 
 const StringSearchJob = struct {
@@ -146,7 +147,7 @@ fn file_search(job: StringSearchJob) void {
 
     std.log.debug("strsearching {s}", .{job.file_path});
     if (str.strsearch(job.search_context.search_needle, data)) {
-        std.log.info("Found a result in {s}.", .{job.file_path});
+        job.search_context.out_file.writer().print("{s}\n", .{job.file_path}) catch {};
     }
 }
 
@@ -155,13 +156,29 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var app = yazap.App.init(gpa.allocator(), "rabbit-search", "World's fastest string search.");
+    var app = yazap.App.init(
+        gpa.allocator(),
+        "rabbit-search",
+        "World's fastest string search.",
+    );
     defer app.deinit();
     var rsCmd = app.rootCommand();
-    try rsCmd.addArg(yazap.Arg.positional("NEEDLE", "The string to search for. \".\" by default.", null));
+    try rsCmd.addArg(yazap.Arg.positional(
+        "NEEDLE",
+        "The string to search for. \".\" by default.",
+        null,
+    ));
     try rsCmd.addArg(yazap.Arg.positional("DIR", "The directory to search in.", null));
-    try rsCmd.addArg(yazap.Arg.booleanOption("verbose", 'v', "Be verbose about your actions."));
-    try rsCmd.addArg(yazap.Arg.singleValueOption("jobs", 'j', "Use N threads in parallel."));
+    try rsCmd.addArg(yazap.Arg.booleanOption(
+        "verbose",
+        'v',
+        "Be verbose about your actions.",
+    ));
+    try rsCmd.addArg(yazap.Arg.singleValueOption(
+        "jobs",
+        'j',
+        "Use N threads in parallel.",
+    ));
 
     const args = try app.parseProcess();
     if (!args.containsArgs()) {
@@ -201,6 +218,7 @@ pub fn main() !void {
     // Prepare the searching context.
     const search_context = SearchContext{
         .search_needle = args.getSingleValue("NEEDLE").?,
+        .out_file = std.io.getStdOut(),
     };
 
     // To make filesystem traversal faster and easier, we attempt to setrlimit to be a
