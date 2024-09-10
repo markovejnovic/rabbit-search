@@ -7,6 +7,21 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const stringzilla = b.addStaticLibrary(.{
+        .name = "StringZilla",
+        .target = target,
+        .optimize = optimize,
+    });
+    stringzilla.addIncludePath(b.path("third-party/StringZilla/include/"));
+    stringzilla.defineCMacro("SZ_DYNAMIC_DISPATCH", "0");
+    stringzilla.defineCMacro("SZ_USE_X86_AVX512", "1");
+    stringzilla.defineCMacro("SZ_USE_X86_AVX2", "0");
+    stringzilla.defineCMacro("SZ_AVOID_LIBC", "1");
+    stringzilla.addCSourceFile(.{
+        .file = b.path("third-party/StringZilla/c/lib.c"),
+    });
+    stringzilla.linkLibC();
+
     // Let's add the main executable we want to build.
     const exe = b.addExecutable(.{
         .name = "rabbit-search",
@@ -18,6 +33,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("yazap", yazap.module("yazap"));
 
     exe.linkLibC();
+    exe.linkLibrary(stringzilla);
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default

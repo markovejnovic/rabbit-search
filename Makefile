@@ -7,14 +7,16 @@ endif
 .PHONY: build benchmark-mp download-linux-repo
 
 # Create the binary
-build:
-	zig build -j$(JOBS)
+build: pull-stringzilla
+	zig build -j$(JOBS) $(COMPILE_ARGS)
 
 # Run the multiprocessing benchmarks.
 benchmark-mp: build download-linux-repo
 	mkdir -p build
 	./build-tools/bench-mp.sh ./zig-out/bin/rabbit-search "example" third-party/linux build
 
-# Download the linux repo
 download-linux-repo:
 	git submodule update --init third-party/linux
+
+pull-stringzilla:
+	git submodule update --init third-party/StringZilla
