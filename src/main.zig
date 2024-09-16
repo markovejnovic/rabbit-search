@@ -227,6 +227,13 @@ pub fn main() !void {
     try std.posix.setrlimit(.NOFILE, .{ .cur = max_lim, .max = max_lim });
 
     // Traverse the filesystem and feed each worker with work.
+    // We batch the total number of
+    const BATCH_SIZE = 8;
+    var producer_job_buffer = try std.ArrayList(StringSearchJob).initCapacity(
+        gpa.allocator(),
+        BATCH_SIZE,
+    );
+
     var fs_start = try std.fs.openDirAbsolute(to_search, .{ .iterate = true });
     defer fs_start.close();
 
@@ -239,9 +246,21 @@ pub fn main() !void {
             &file,
             gpa.allocator(),
         )) |search_job| {
-            try thread_pool.enqueue(search_job);
+            // We have found a new file that we should search through. Let us push the
+            // file into our local buffer.
+            try producer_job_buffer.append(search_job);
+
+            // If the producer-local buffer ends up getting filled up, then what we do
+            // is we enqueue our jobs into the threadpool.
+            if (producer_job_buffer.items.len == producer_job_buffer.capacity) {
+                try thread_pool.enqueueSlice(producer_job_buffer.items);
+                producer_job_buffer.clearAndFree();
+            }
         }
     }
+
+    // There might be some junk left over in the original buffer. Let's enqueue that.
+    try thread_pool.enqueueSlice(producer_job_buffer.items);
 
     // This is critical because we need to prevent the memory allocated by fs_walker to
     // be deallocated prematurely.
