@@ -245,5 +245,5 @@ pub fn main() !void {
 
     // This is critical because we need to prevent the memory allocated by fs_walker to
     // be deallocated prematurely.
-    thread_pool.block_until_empty();
+    try thread_pool.blockUntilEmpty();
 }

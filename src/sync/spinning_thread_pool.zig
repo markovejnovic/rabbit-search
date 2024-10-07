@@ -1,5 +1,5 @@
 const std = @import("std");
-const Queue = @import("./queue.zig").Queue;
+const SPMCQueue = @import("./queue.zig").SPMCQueue;
 
 pub fn SpinningThreadPool(
     comptime JobT: type,
@@ -7,8 +7,9 @@ pub fn SpinningThreadPool(
 ) type {
     return struct {
         const Self = @This();
+        const QUEUE_CAPACITY: usize = 1024;
 
-        jobs: Queue(JobT),
+        jobs: SPMCQueue(JobT, null, null),
         workers: std.ArrayList(std.Thread),
         worker_count: u16,
 
@@ -17,8 +18,8 @@ pub fn SpinningThreadPool(
         close_event: std.atomic.Value(bool),
 
         /// Take one job from the work queue and run it.
-        fn fetch_and_do_job(self: *Self) void {
-            if (self.jobs.try_pop()) |job| {
+        fn fetchAndDo(self: *Self) void {
+            if (self.jobs.tryPop()) |job| {
                 // Run it.
                 work_f(job);
             }
@@ -29,7 +30,7 @@ pub fn SpinningThreadPool(
             // We will spin until the parent thread asks us to shut the hell up.
             while (!tp.close_event.load(.unordered)) {
                 // Fetch a job, and if one exists...
-                tp.fetch_and_do_job();
+                tp.fetchAndDo();
             }
         }
 
@@ -39,7 +40,11 @@ pub fn SpinningThreadPool(
         ) !Self {
             var self = Self{
                 // Let us initialize the work queue.
-                .jobs = Queue(JobT).init(alloc),
+                .jobs = try SPMCQueue(JobT, null, null).init(
+                    alloc,
+                    worker_count,
+                    QUEUE_CAPACITY,
+                ),
 
                 // Let's create the workers vector.
                 .workers = std.ArrayList(std.Thread).init(alloc),
@@ -61,11 +66,13 @@ pub fn SpinningThreadPool(
 
         /// Hostage the current thread to perform work too until the job queue empties
         /// out.
-        pub fn block_until_empty(self: *Self) void {
+        pub fn blockUntilEmpty(self: *Self) !void {
             // Treat self similarly to tq_worker, but instead of guarding on the event,
             // we guard on the size of the queue.
             while (self.jobs.len() > 0) {
-                self.fetch_and_do_job();
+                // TODO(mvejnovic): This is kind of crappy because this thread could
+                // also be doing real good work.
+                try std.Thread.yield();
             }
 
             self.terminate();
@@ -109,7 +116,7 @@ pub fn SpinningThreadPool(
         }
 
         pub fn enqueue(self: *Self, task: JobT) !void {
-            try self.jobs.push(task);
+            try self.jobs.push(task, 1 * std.time.ns_per_s);
         }
     };
 }

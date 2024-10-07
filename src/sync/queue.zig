@@ -125,10 +125,7 @@ pub fn SPSCQueue(comptime T: type, comptime comptime_capacity: ?usize) type {
             // This is the total number of chunks we plan on allocating.
             const requested_raw_capacity = desired_capacity + 1;
 
-            // Simply the maximum number of bytes
-            const max_raw_capacity = std.math.maxInt(usize);
-
-            if (requested_raw_capacity > max_raw_capacity - 2 * SlotsPadding) {
+            if (requested_raw_capacity > std.math.maxInt(usize) - 2 * SlotsPadding) {
                 return error.InvalidCapacity;
             }
 
@@ -159,6 +156,16 @@ pub fn SPSCQueue(comptime T: type, comptime comptime_capacity: ?usize) type {
 
         pub fn capacity(self: *const Self) bool {
             return self.capacity - 1;
+        }
+
+        pub fn len(self: *const Self) usize {
+            const diff = self.write_idx.load(.monotonic) - self.read_idx.load(.monotonic);
+
+            if (diff < 0) {
+                return diff + self.capacity;
+            }
+
+            return diff;
         }
 
         pub fn empty(self: *const Self) bool {
@@ -457,7 +464,10 @@ pub fn SPMCQueue(
 
             // Allocate enough memory for the array list
             var self: Self = .{
-                .queues = try std.ArrayList(SPSC).initCapacity(allocator, desired_queue_count),
+                .queues = try std.ArrayList(SPSC).initCapacity(
+                    allocator,
+                    desired_queue_count,
+                ),
                 .push_idx = std.atomic.Value(usize).init(0),
                 .rolling_consumer_idx = std.atomic.Value(usize).init(0),
             };
@@ -494,6 +504,22 @@ pub fn SPMCQueue(
             // the push was successful or not, but this queue is responsible for
             // waiting.
             return self.queues.items[consumer_idx].spinPop(timeout_ns);
+        }
+
+        pub fn tryPop(self: *Self) ?T {
+            // Note the semantics of the SPSCQueue are not consistent with the
+            // semantics of this queue. That queue returns a boolean indicating whether
+            // the push was successful or not, but this queue is responsible for
+            // waiting.
+            return self.queues.items[consumer_idx].pop();
+        }
+
+        pub fn len(self: *const Self) usize {
+            var sum_len: usize = 0;
+            for (self.queues.items) |q| {
+                sum_len += q.len();
+            }
+            return sum_len;
         }
 
         /// Register a new thread as a consumer.
