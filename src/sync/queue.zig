@@ -10,6 +10,25 @@ fn intln2(comptime n: anytype) @TypeOf(n) {
     return std.math.log2(n);
 }
 
+/// Note that this function does not sanitize comptime_capacity nor capacity
+fn cyclicalIdx(index: usize, comptime comptime_capacity: ?usize, capacity: ?usize) usize {
+    if (comptime_capacity != null and isPowerOfTwo(comptime_capacity.?)) {
+        // This and trick is equivalent to performing the modulo operation for
+        // powers of two.
+        const mask = comptime_capacity.? - 1;
+
+        return (index + 1) & mask;
+    } else {
+        var next_read_idx: usize = undefined;
+        next_read_idx = index + 1;
+        if (next_read_idx == capacity) {
+            next_read_idx = 0;
+        }
+
+        return next_read_idx;
+    }
+}
+
 /// Thread-safe synchronization queue.
 pub fn Queue(comptime T: type) type {
     return struct {
@@ -87,12 +106,24 @@ pub fn SPSCQueue(comptime T: type, comptime comptime_capacity: ?usize) type {
                 return error.InvalidCapacity;
             }
 
-            if (requested_capacity orelse comptime_capacity.? == 0) {
-                return error.InvalidCapacity;
+            var desired_capacity: usize = 0;
+
+            if (requested_capacity != null) {
+                desired_capacity = requested_capacity.?;
+                if (requested_capacity.? == 0) {
+                    return error.InvalidCapacity;
+                }
+            }
+
+            if (comptime_capacity != null) {
+                desired_capacity = comptime_capacity.?;
+                if (comptime_capacity.? == 0) {
+                    return error.InvalidCapacity;
+                }
             }
 
             // This is the total number of chunks we plan on allocating.
-            const requested_raw_capacity = (requested_capacity orelse comptime_capacity.?) + 1;
+            const requested_raw_capacity = desired_capacity + 1;
 
             // Simply the maximum number of bytes
             const max_raw_capacity = std.math.maxInt(usize);
@@ -136,7 +167,7 @@ pub fn SPSCQueue(comptime T: type, comptime comptime_capacity: ?usize) type {
 
         pub fn push(self: *Self, value: T) bool {
             const write_idx = self.write_idx.load(.monotonic);
-            const next_write_idx = self.nextIdx(write_idx);
+            const next_write_idx = cyclicalIdx(write_idx, comptime_capacity, self.capacity);
 
             if (next_write_idx == self.read_idx_cache) {
                 // If the indices are the same, the read_idx_cache is now out of date.
@@ -172,7 +203,10 @@ pub fn SPSCQueue(comptime T: type, comptime comptime_capacity: ?usize) type {
 
             // The following block computes the next read index.
             // Because capacity may be comptime
-            self.read_idx.store(self.nextIdx(read_idx), .release);
+            self.read_idx.store(
+                cyclicalIdx(read_idx, comptime_capacity, self.capacity),
+                .release,
+            );
 
             return val;
         }
@@ -223,24 +257,6 @@ pub fn SPSCQueue(comptime T: type, comptime comptime_capacity: ?usize) type {
 
             return self.slots[read_idx + SlotsPadding];
         }
-
-        fn nextIdx(self: *const Self, index: usize) usize {
-            if (comptime_capacity != null and isPowerOfTwo(comptime_capacity.?)) {
-                // This and trick is equivalent to performing the modulo operation for
-                // powers of two.
-                const mask = comptime_capacity.? - 1;
-
-                return (index + 1) & mask;
-            } else {
-                var next_read_idx: usize = undefined;
-                next_read_idx = index + 1;
-                if (next_read_idx == self.capacity) {
-                    next_read_idx = 0;
-                }
-
-                return next_read_idx;
-            }
-        }
     };
 }
 
@@ -252,7 +268,6 @@ test "spsc no data loss underfilled queue" {
     const num_increments = 1000;
 
     const Q = SPSCQueue(u32, null);
-
     const Runner = struct {
         queue: *Q,
 
@@ -275,7 +290,7 @@ test "spsc no data loss underfilled queue" {
     var recv_counter: u32 = 0;
     var i: usize = 0;
     while (recv_counter < num_increments and i < num_increments) : (i += 1) {
-        const new_recv_counter = try queue.spinPop(std.time.ns_per_ms * 10);
+        const new_recv_counter = try queue.spinPop(std.time.ns_per_ms * 1000);
         try std.testing.expectEqual(recv_counter + 1, new_recv_counter);
         recv_counter = new_recv_counter;
     }
@@ -402,4 +417,267 @@ test "spsc no data loss overfilled queue comptime length" {
     try std.testing.expectEqual(num_increments, recv_counter);
 
     thread.join();
+}
+
+pub fn SPMCQueue(
+    comptime T: type,
+    comptime comptime_queue_count: ?usize,
+    comptime comptime_capacity: ?usize,
+) type {
+    return struct {
+        const Self = @This();
+        const SPSC = SPSCQueue(T, comptime_capacity);
+
+        threadlocal var consumer_idx: usize = undefined;
+
+        queues: std.ArrayList(SPSC),
+        push_idx: std.atomic.Value(usize),
+        rolling_consumer_idx: std.atomic.Value(usize),
+
+        pub fn init(allocator: std.mem.Allocator, queue_count: ?usize, requested_capacity: ?usize) !Self {
+            if (comptime_queue_count == null and queue_count == null) {
+                return error.InvalidQueueCount;
+            }
+
+            if (comptime_queue_count != null and queue_count != null and comptime_queue_count != queue_count) {
+                return error.InvalidQueueCount;
+            }
+
+            var desired_queue_count: usize = 0;
+            if (queue_count != null) {
+                desired_queue_count = queue_count.?;
+            }
+            if (comptime_queue_count != null) {
+                desired_queue_count = comptime_queue_count.?;
+            }
+
+            if (desired_queue_count == 0) {
+                return error.InvalidQueueCount;
+            }
+
+            // Allocate enough memory for the array list
+            var self: Self = .{
+                .queues = try std.ArrayList(SPSC).initCapacity(allocator, desired_queue_count),
+                .push_idx = std.atomic.Value(usize).init(0),
+                .rolling_consumer_idx = std.atomic.Value(usize).init(0),
+            };
+
+            // Populate the array list with a bunch of queues (however many the user
+            // requested).
+            for (0..desired_queue_count) |_| {
+                try self.queues.append(try SPSC.init(allocator, requested_capacity));
+            }
+
+            return self;
+        }
+
+        pub fn push(self: *Self, value: T, timeout_ns: u64) !void {
+            // Note the semantics of the SPSCQueue are not consistent with the
+            // semantics of this queue. That queue returns a boolean indicating whether
+            // the push was successful or not, but this queue is responsible for
+            // waiting.
+            const push_idx = self.push_idx.load(.monotonic);
+
+            var relevant_queue: *SPSC = &self.queues.items[push_idx];
+            try relevant_queue.spinPush(value, timeout_ns);
+            const new_idx = cyclicalIdx(
+                push_idx,
+                comptime_queue_count,
+                self.queues.capacity,
+            );
+            self.push_idx.store(new_idx, .monotonic);
+        }
+
+        pub fn pop(self: *Self, timeout_ns: u64) !T {
+            // Note the semantics of the SPSCQueue are not consistent with the
+            // semantics of this queue. That queue returns a boolean indicating whether
+            // the push was successful or not, but this queue is responsible for
+            // waiting.
+            return self.queues.items[consumer_idx].spinPop(timeout_ns);
+        }
+
+        /// Register a new thread as a consumer.
+        pub fn registerConsumer(self: *Self) void {
+            consumer_idx = self.rolling_consumer_idx.fetchAdd(1, .monotonic);
+        }
+
+        pub fn deinit(self: *Self) void {
+            for (0..self.queues.items.len) |idx| {
+                self.queues.items[idx].deinit();
+            }
+
+            self.queues.deinit();
+        }
+    };
+}
+
+test "spmc no data loss underfilled queue" {
+    if (builtin.single_threaded) {
+        return error.SkipZigTest;
+    }
+
+    const num_increments = 1000;
+    const thread_count: usize = 4;
+
+    const Q = SPMCQueue(u32, null, null);
+    const Runner = struct {
+        queue: *Q,
+        idx: usize,
+
+        fn init(queue: *Q, idx: usize) @This() {
+            return .{
+                .queue = queue,
+                .idx = idx,
+            };
+        }
+
+        fn run(self: @This()) !void {
+            self.queue.registerConsumer();
+
+            for (0..num_increments) |inc| {
+                const popped_el = try self.queue.pop(1000 * std.time.ns_per_ms);
+                // Topmost digit is the thread idx.
+                const actual_tidx = popped_el / 1000;
+                const actual_num = popped_el % 1000;
+
+                try std.testing.expectEqual(actual_tidx, self.idx);
+                try std.testing.expectEqual(actual_num, inc);
+            }
+        }
+    };
+
+    var queue = try Q.init(std.testing.allocator, thread_count, 1024);
+    defer queue.deinit();
+
+    // Start the consumer threads.
+    var threads = std.ArrayList(std.Thread).init(std.testing.allocator);
+    defer threads.deinit();
+    for (0..thread_count) |i| {
+        const runner = Runner.init(&queue, i);
+        try threads.append(try std.Thread.spawn(.{}, Runner.run, .{runner}));
+    }
+
+    for (0..num_increments) |inc| {
+        for (0..thread_count) |tidx| {
+            try queue.push(@intCast(tidx * 1000 + inc), 10 * std.time.ns_per_ms);
+        }
+    }
+
+    for (threads.items) |thread| {
+        thread.join();
+    }
+}
+
+test "spmc no data loss overfilled queue" {
+    if (builtin.single_threaded) {
+        return error.SkipZigTest;
+    }
+
+    const num_increments = 1000;
+    const thread_count: usize = 4;
+
+    const Q = SPMCQueue(u32, null, null);
+    const Runner = struct {
+        queue: *Q,
+        idx: usize,
+
+        fn init(queue: *Q, idx: usize) @This() {
+            return .{
+                .queue = queue,
+                .idx = idx,
+            };
+        }
+
+        fn run(self: @This()) !void {
+            self.queue.registerConsumer();
+
+            for (0..num_increments) |inc| {
+                const popped_el = try self.queue.pop(1000 * std.time.ns_per_ms);
+                // Topmost digit is the thread idx.
+                const actual_tidx = popped_el / 1000;
+                const actual_num = popped_el % 1000;
+
+                try std.testing.expectEqual(actual_tidx, self.idx);
+                try std.testing.expectEqual(actual_num, inc);
+            }
+        }
+    };
+
+    var queue = try Q.init(std.testing.allocator, thread_count, 64);
+    defer queue.deinit();
+
+    // Start the consumer threads.
+    var threads = std.ArrayList(std.Thread).init(std.testing.allocator);
+    defer threads.deinit();
+    for (0..thread_count) |i| {
+        const runner = Runner.init(&queue, i);
+        try threads.append(try std.Thread.spawn(.{}, Runner.run, .{runner}));
+    }
+
+    for (0..num_increments) |inc| {
+        for (0..thread_count) |tidx| {
+            try queue.push(@intCast(tidx * 1000 + inc), 10 * std.time.ns_per_ms);
+        }
+    }
+
+    for (threads.items) |thread| {
+        thread.join();
+    }
+}
+
+test "comptime spmc no data loss overfilled queue" {
+    if (builtin.single_threaded) {
+        return error.SkipZigTest;
+    }
+
+    const num_increments = 1000;
+    const thread_count: usize = 4;
+
+    const Q = SPMCQueue(u32, 4, 64);
+    const Runner = struct {
+        queue: *Q,
+        idx: usize,
+
+        fn init(queue: *Q, idx: usize) @This() {
+            return .{
+                .queue = queue,
+                .idx = idx,
+            };
+        }
+
+        fn run(self: @This()) !void {
+            self.queue.registerConsumer();
+
+            for (0..num_increments) |inc| {
+                const popped_el = try self.queue.pop(1000 * std.time.ns_per_ms);
+                // Topmost digit is the thread idx.
+                const actual_tidx = popped_el / 1000;
+                const actual_num = popped_el % 1000;
+
+                try std.testing.expectEqual(actual_tidx, self.idx);
+                try std.testing.expectEqual(actual_num, inc);
+            }
+        }
+    };
+
+    var queue = try Q.init(std.testing.allocator, thread_count, null);
+    defer queue.deinit();
+
+    // Start the consumer threads.
+    var threads = std.ArrayList(std.Thread).init(std.testing.allocator);
+    defer threads.deinit();
+    for (0..thread_count) |i| {
+        const runner = Runner.init(&queue, i);
+        try threads.append(try std.Thread.spawn(.{}, Runner.run, .{runner}));
+    }
+
+    for (0..num_increments) |inc| {
+        for (0..thread_count) |tidx| {
+            try queue.push(@intCast(tidx * 1000 + inc), 10 * std.time.ns_per_ms);
+        }
+    }
+
+    for (threads.items) |thread| {
+        thread.join();
+    }
 }
