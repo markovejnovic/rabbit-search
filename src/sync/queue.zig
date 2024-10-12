@@ -159,13 +159,16 @@ pub fn SPSCQueue(comptime T: type, comptime comptime_capacity: ?usize) type {
         }
 
         pub fn len(self: *const Self) usize {
-            const diff = self.write_idx.load(.monotonic) - self.read_idx.load(.monotonic);
+            const diff = @subWithOverflow(
+                self.write_idx.load(.monotonic),
+                self.read_idx.load(.monotonic),
+            );
 
-            if (diff < 0) {
-                return diff + self.capacity;
+            if (diff[1] == 1) {
+                return @addWithOverflow(diff[0], self.capacity)[0];
             }
 
-            return diff;
+            return diff[0];
         }
 
         pub fn empty(self: *const Self) bool {
