@@ -26,11 +26,13 @@ pub fn SpinningThreadPool(
         }
 
         /// Callable invoked by the worker threads.
-        fn tq_worker(tp: *Self) void {
+        fn tq_worker(self: *Self) void {
+            self.jobs.registerConsumer();
+
             // We will spin until the parent thread asks us to shut the hell up.
-            while (!tp.close_event.load(.unordered)) {
+            while (!self.close_event.load(.unordered)) {
                 // Fetch a job, and if one exists...
-                tp.fetchAndDo();
+                self.fetchAndDo();
             }
         }
 

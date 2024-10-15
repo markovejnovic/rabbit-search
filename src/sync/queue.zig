@@ -200,19 +200,15 @@ pub fn SPSCQueue(comptime T: type, comptime comptime_capacity: ?usize) type {
         pub fn pop(self: *Self) ?T {
             const val = self.front();
             if (val == null) {
-                return val;
+                return null;
             }
 
-            const read_idx = self.read_idx.load(.monotonic);
-
             // TODO(mvejnovic): Do we need this barrier?
-            const write_idx = self.write_idx.load(.acquire);
-
-            // This assertion proves that front() has been invoked.
-            std.debug.assert(write_idx != read_idx);
+            _ = self.write_idx.load(.acquire);
 
             // The following block computes the next read index.
             // Because capacity may be comptime
+            const read_idx = self.read_idx.load(.monotonic);
             self.read_idx.store(
                 cyclicalIdx(read_idx, comptime_capacity, self.capacity),
                 .release,
