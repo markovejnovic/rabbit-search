@@ -22,6 +22,15 @@ pub fn build(b: *std.Build) void {
     });
     stringzilla.linkLibC();
 
+    const clib = b.addStaticLibrary(.{
+        .name = "cex",
+        .target = target,
+        .optimize = optimize,
+    });
+    clib.addIncludePath(b.path("c"));
+    clib.addCSourceFile(.{ .file = b.path("c/sysops.c") });
+    clib.linkLibC();
+
     // Let's add the main executable we want to build.
     const exe = b.addExecutable(.{
         .name = "rabbit-search",
@@ -34,6 +43,8 @@ pub fn build(b: *std.Build) void {
 
     exe.linkLibC();
     exe.linkLibrary(stringzilla);
+    exe.addIncludePath(b.path("c"));
+    exe.linkLibrary(clib);
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default

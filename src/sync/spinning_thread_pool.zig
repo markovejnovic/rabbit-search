@@ -1,6 +1,9 @@
 const std = @import("std");
 const SPMCQueue = @import("./queue.zig").SPMCQueue;
 const sys = @import("../sys.zig");
+const sysops = @cImport({
+    @cInclude("sysops.h");
+});
 
 pub fn SpinningThreadPool(
     comptime JobT: type,
@@ -34,6 +37,12 @@ pub fn SpinningThreadPool(
         fn tq_worker(self: *Self) void {
             self.jobs.registerConsumer();
 
+            const cpu_id = targetCpu(self.thread_counter.fetchAdd(1, .monotonic));
+            if (sysops.pinThreadToCore(@intCast(cpu_id)) != 0) {
+                std.log.err("Failed to pin thread to core.", .{});
+                return;
+            }
+
             // We will spin until the parent thread asks us to shut the hell up.
             while (!self.close_event.load(.unordered)) {
                 // Fetch a job, and if one exists...
@@ -42,7 +51,10 @@ pub fn SpinningThreadPool(
         }
 
         fn targetCpu(thread_id: usize) usize {
-            return (thread_id % sys.getNumCpus() - 1) + 1;
+            // Avoid pinning on the first core because that core is responsible for
+            // loading into memory.
+            const available_cpus = @as(usize, @intCast(sysops.getNumCpus())) - 1;
+            return (thread_id % available_cpus) + 1;
         }
 
         pub fn init(
