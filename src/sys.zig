@@ -2,7 +2,7 @@ const cSysinfo = @cImport({
     @cInclude("sys/sysinfo.h");
 });
 
-pub fn get_available_cores() u64 {
+pub fn getNumCpus() u64 {
     return @intCast(cSysinfo.get_nprocs());
 }
 

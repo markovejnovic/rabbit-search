@@ -1,5 +1,6 @@
 const std = @import("std");
 const SPMCQueue = @import("./queue.zig").SPMCQueue;
+const sys = @import("../sys.zig");
 
 pub fn SpinningThreadPool(
     comptime JobT: type,
@@ -16,6 +17,10 @@ pub fn SpinningThreadPool(
         // Signifies whenever the queue is invoked to be terminated. Worker threads must
         // respect this as quickly asp ossible.
         close_event: std.atomic.Value(bool),
+
+        // Counter for the total number of threads that are running. This is useful as
+        // it helps us decide which CPU to pin the thread on.
+        thread_counter: std.atomic.Value(usize),
 
         /// Take one job from the work queue and run it.
         fn fetchAndDo(self: *Self) void {
@@ -36,6 +41,10 @@ pub fn SpinningThreadPool(
             }
         }
 
+        fn targetCpu(thread_id: usize) usize {
+            return (thread_id % sys.getNumCpus() - 1) + 1;
+        }
+
         pub fn init(
             alloc: std.mem.Allocator,
             worker_count: u16,
@@ -54,6 +63,8 @@ pub fn SpinningThreadPool(
                 .worker_count = worker_count,
 
                 .close_event = std.atomic.Value(bool).init(false),
+
+                .thread_counter = std.atomic.Value(usize).init(0),
             };
             try self.workers.ensureTotalCapacity(worker_count);
             return self;

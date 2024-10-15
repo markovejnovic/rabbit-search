@@ -434,13 +434,21 @@ pub fn SPMCQueue(
         const Self = @This();
         const SPSC = SPSCQueue(T, comptime_capacity);
 
+        // TODO(mvejnovic): Note that this causes this SPMC queue to only be a
+        // singleton. This can be mitigated by macking the thread local memory a map of
+        // consumer indices from queue ptrs. Doesn't matter in this application since
+        // we only need one SPMC queue in this particular application.
         threadlocal var consumer_idx: usize = undefined;
 
         queues: std.ArrayList(SPSC),
         push_idx: std.atomic.Value(usize),
         rolling_consumer_idx: std.atomic.Value(usize),
 
-        pub fn init(allocator: std.mem.Allocator, queue_count: ?usize, requested_capacity: ?usize) !Self {
+        pub fn init(
+            allocator: std.mem.Allocator,
+            queue_count: ?usize,
+            requested_capacity: ?usize,
+        ) !Self {
             if (comptime_queue_count == null and queue_count == null) {
                 return error.InvalidQueueCount;
             }

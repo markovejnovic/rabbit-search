@@ -191,7 +191,7 @@ pub fn main() !void {
     if (args.getSingleValue("jobs")) |jobs_str| {
         jobs = try std.fmt.parseInt(u16, jobs_str, 10);
     } else {
-        jobs = @intCast(sys.get_available_cores());
+        jobs = @intCast(sys.getNumCpus());
     }
 
     // Parse the search directory.
