@@ -4,6 +4,7 @@ const sys = @import("../sys.zig");
 const sysops = @cImport({
     @cInclude("sysops.h");
 });
+const trace = @import("../trace.zig");
 
 pub fn SpinningThreadPool(
     comptime JobT: type,
@@ -30,14 +31,21 @@ pub fn SpinningThreadPool(
             if (self.jobs.tryPop()) |job| {
                 // Run it.
                 work_f(job);
+                return;
             }
+
+            trace.evt_worker_wait();
+            sys.spinlockYield();
         }
 
         /// Callable invoked by the worker threads.
         fn tq_worker(self: *Self) void {
             self.jobs.registerConsumer();
 
-            const cpu_id = targetCpu(self.thread_counter.fetchAdd(1, .monotonic));
+            // TODO(mvejnovic): This fetchAdd adds 2 because the cores on MY machine
+            // are clustered into two. This is a hack and should be fixed.
+            // My physical cores are every other core.
+            const cpu_id = targetCpu(self.thread_counter.fetchAdd(2, .monotonic));
             if (sysops.pinThreadToCore(@intCast(cpu_id)) != 0) {
                 std.log.err("Failed to pin thread to core.", .{});
                 return;
@@ -76,7 +84,9 @@ pub fn SpinningThreadPool(
 
                 .close_event = std.atomic.Value(bool).init(false),
 
-                .thread_counter = std.atomic.Value(usize).init(0),
+                // TODO(mvejnovic): This is hacky because the main.zig sets the main
+                // core as the first core.
+                .thread_counter = std.atomic.Value(usize).init(2),
             };
             try self.workers.ensureTotalCapacity(worker_count);
             return self;

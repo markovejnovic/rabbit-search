@@ -4,6 +4,9 @@ const sys = @import("sys.zig");
 const builtin = @import("builtin");
 const sync = @import("sync/sync.zig");
 const str = @import("str.zig");
+const sysops = @cImport({
+    @cInclude("sysops.h");
+});
 
 const SearchContext = struct {
     search_needle: []const u8,
@@ -230,6 +233,12 @@ pub fn main() !void {
     var fs_start = try std.fs.openDirAbsolute(to_search, .{ .iterate = true });
     defer fs_start.close();
 
+    // Pin the file-tree traversal onto one core to minimize contention between it and
+    // the consumers.
+    if (sysops.pinThreadToCore(@intCast(0)) != 0) {
+        std.log.err("Failed to pin thread to core.", .{});
+        return;
+    }
     var fs_walker = try fs_start.walk(gpa.allocator());
     defer fs_walker.deinit();
     while (try fs_walker.next()) |file| {
