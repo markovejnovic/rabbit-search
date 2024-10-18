@@ -9,7 +9,6 @@ const sysops = @cImport({
 });
 
 const SearchContext = struct {
-    search_needle: []const u8,
     out_file: std.fs.File,
 };
 
@@ -17,6 +16,7 @@ const StringSearchJob = struct {
     const Self = @This();
 
     search_context: *const SearchContext,
+    searcher: *str.CompiledSearcher(512),
 
     file_path: []u8,
 
@@ -37,11 +37,12 @@ const StringSearchJob = struct {
     pub fn init(
         // TODO(markovejnovic): I don't know how I feel passing so much crap down into
         // this constructor. Perhaps these should be done by the caller?
+        searcher: *str.CompiledSearcher(512),
         search_context: *const SearchContext,
         search_start: *const std.fs.Dir,
         walker_entry: *const std.fs.Dir.Walker.Entry,
         alloc: std.mem.Allocator,
-    ) ?Self {
+    ) !?Self {
         switch (walker_entry.kind) {
             .file => {
                 const abs_path = search_start.realpathAlloc(
@@ -55,6 +56,7 @@ const StringSearchJob = struct {
                     return null;
                 };
                 return Self{
+                    .searcher = searcher,
                     .search_context = search_context,
                     .alloc = alloc,
                     .file_path = abs_path,
@@ -85,7 +87,9 @@ const StringSearchJob = struct {
     }
 };
 
-fn file_search(job: StringSearchJob) void {
+fn fileSearch(job: StringSearchJob) void {
+    var searcher = job.searcher;
+
     // We will need to deallocate the job in the searcher thread.
     defer job.deinit();
     std.log.debug("Searching for {}", .{job});
@@ -108,50 +112,77 @@ fn file_search(job: StringSearchJob) void {
     const file_sz = file_stats.size;
 
     // Easy-case, exit early, we know we won't find shit here.
-    if (file_sz == 0) {
+    // TODO(mvejnovic): Mark unlikely
+    if (file_sz < searcher.needleLen()) {
         return;
     }
 
-    // TODO(markovejnovic): Query the system from /proc/meminfo | grep Hugepagesize
-    const HUGE_PG_SZ = 2048 * 1024;
-    //const use_tlb = file_sz >= HUGE_PG_SZ;
-    const use_tlb = false; // TODO(markovejnovic): Figure out why on earth mmap returns
-    // einval for use_tlb = True, even though everything looks
-    // well populated. Maybe bug in sys.boundary_align
-    const alloc_sz = if (use_tlb) sys.boundary_align(file_sz, HUGE_PG_SZ) else file_sz;
+    // Traverse the file in chunks equal to the optimal size
+    var read_buf: [@TypeOf(searcher.*).BatchSize]u8 = undefined;
+    while (true) {
+        const bytes_read = file.readAll(&read_buf) catch |err| {
+            std.log.err(
+                "Unexpected error occurred reading {any}: {any}",
+                .{ job.file_path, err },
+            );
+            return;
+        };
 
-    std.log.debug("mmap()ing {s}", .{job.file_path});
-    const data = std.posix.mmap(
-        null,
-        alloc_sz,
-        std.posix.PROT.READ,
-        .{
-            // TODO(markovejnovic): Pull this information from
-            // /proc/meminfo | grep Hugepagesize
-            .HUGETLB = use_tlb,
-            .POPULATE = true,
-            .TYPE = .PRIVATE,
-        },
-        file.handle,
-        0,
-    ) catch |err| {
-        std.log.err("Could not mmap() {} due to {}", .{ job, err });
-        return;
-    };
-    defer std.posix.munmap(data);
+        if (bytes_read < @TypeOf(searcher.*).BatchSize) {
+            // We read less bytes than the read buffer. If we have not exited the
+            // function by now, let's submit the last batch and call it a day.
+            // TODO(mvejnovic): This block is duplicated.
+            // TODO(mvejnovic): Mark unlikely
+            if (searcher.submitBatch(read_buf)) {
+                job.search_context.out_file.writer().print("{s}\n", .{job.file_path}) catch {};
+            }
+            return;
+        }
 
-    std.posix.madvise(
-        data.ptr,
-        file_sz,
-        std.posix.MADV.SEQUENTIAL | std.posix.MADV.WILLNEED,
-    ) catch |err| {
-        std.log.warn("Could not madvise() {} due to {}.", .{ job, err });
-    };
+        // Otherwise, we've read 256 bytes exactly. Lucky us. Let's submit the batch
+        // and, if that batch returns anything, means we've found our guy.
+        // TODO(mvejnovic): This block is duplicated.
+        // TODO(mvejnovic): Mark unlikely
+        if (searcher.submitBatch(read_buf)) {
+            job.search_context.out_file.writer().print("{s}\n", .{job.file_path}) catch {};
+        }
 
-    std.log.debug("strsearching {s}", .{job.file_path});
-    if (str.strsearch(job.search_context.search_needle, data)) {
-        job.search_context.out_file.writer().print("{s}\n", .{job.file_path}) catch {};
+        // If the batch doesn't find anything, read some more in hopes we'll find
+        // something.
     }
+
+    //std.log.debug("mmap()ing {s}", .{job.file_path});
+    //const data = std.posix.mmap(
+    //    null,
+    //    alloc_sz,
+    //    std.posix.PROT.READ,
+    //    .{
+    //        // TODO(markovejnovic): Pull this information from
+    //        // /proc/meminfo | grep Hugepagesize
+    //        .HUGETLB = use_tlb,
+    //        .POPULATE = true,
+    //        .TYPE = .PRIVATE,
+    //    },
+    //    file.handle,
+    //    0,
+    //) catch |err| {
+    //    std.log.err("Could not mmap() {} due to {}", .{ job, err });
+    //    return;
+    //};
+    //defer std.posix.munmap(data);
+
+    //std.posix.madvise(
+    //    data.ptr,
+    //    file_sz,
+    //    std.posix.MADV.SEQUENTIAL | std.posix.MADV.WILLNEED,
+    //) catch |err| {
+    //    std.log.warn("Could not madvise() {} due to {}.", .{ job, err });
+    //};
+
+    //std.log.debug("strsearching {s}", .{job.file_path});
+    //if (job.searcher.submitBatch(data)) {
+    //    job.search_context.out_file.writer().print("{s}\n", .{job.file_path}) catch {};
+    //}
 }
 
 pub fn main() !void {
@@ -211,7 +242,7 @@ pub fn main() !void {
     defer gpa.allocator().free(to_search);
 
     // Spin up the thread queue.
-    var thread_pool = try sync.SpinningThreadPool(StringSearchJob, &file_search).init(
+    var thread_pool = try sync.SpinningThreadPool(StringSearchJob, &fileSearch).init(
         gpa.allocator(),
         jobs,
     );
@@ -220,7 +251,6 @@ pub fn main() !void {
 
     // Prepare the searching context.
     const search_context = SearchContext{
-        .search_needle = args.getSingleValue("NEEDLE").?,
         .out_file = std.io.getStdOut(),
     };
 
@@ -241,8 +271,12 @@ pub fn main() !void {
     }
     var fs_walker = try fs_start.walk(gpa.allocator());
     defer fs_walker.deinit();
+
     while (try fs_walker.next()) |file| {
-        if (StringSearchJob.init(
+        const searcher = try gpa.allocator().create(str.CompiledSearcher(512));
+        searcher.* = try str.CompiledSearcher(512).init(args.getSingleValue("NEEDLE").?);
+        if (try StringSearchJob.init(
+            searcher,
             &search_context,
             &fs_start,
             &file,
