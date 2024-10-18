@@ -20,6 +20,9 @@ pub fn build(b: *std.Build) void {
     stringzilla.addCSourceFile(.{
         .file = b.path("third-party/StringZilla/c/lib.c"),
     });
+    stringzilla.addCSourceFile(.{
+        .file = b.path("c/intr.c"),
+    });
     stringzilla.linkLibC();
 
     const clib = b.addStaticLibrary(.{
