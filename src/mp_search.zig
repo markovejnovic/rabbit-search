@@ -103,23 +103,27 @@ pub fn SearchTask() type {
         }
 
         pub fn work(self: *Self, job: StringSearchJob) void {
-            // Whatever happens, this consumer is responsible for cleaning up the job.
-            defer job.deinit();
-
-            // TODO(mvejnovic): Make this allocator be persistent across work sessions
-            // to minimize the overhead of allocation.
-            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-
             // Perform search operation
             std.log.debug("Searching for {}", .{job});
 
+            // Whatever happens, this consumer is responsible for cleaning up the job.
+            defer job.deinit();
+
+            // TODO(mvejnovic): This might not be correct. PATH_MAX is the maximum for
+            // a path chunk, not the full path.
+            var path_buf_raw: [std.posix.PATH_MAX]u8 = undefined;
+
+            // TODO(mvejnovic): Make this allocator be persistent across work sessions
+            // to minimize the overhead of allocation.
+            var path_buf = std.heap.FixedBufferAllocator.init(&path_buf_raw);
+
             // Get the absolute file path if the given job is in fact a file.
-            const file_path = self.getFilePath(job, gpa.allocator());
+            const file_path = self.getFilePath(job, path_buf.allocator());
             if (file_path == null) {
                 std.log.debug("Skipping non-file entry: {s}", .{job.path});
                 return;
             }
-            defer gpa.allocator().free(file_path.?);
+            defer path_buf.allocator().free(file_path.?);
 
             // TODO(markovejnovic): There is a significant number of heuristics we
             //                      could apply
