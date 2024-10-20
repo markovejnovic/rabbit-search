@@ -6,16 +6,21 @@ const sysops = @cImport({
 });
 
 pub fn SpinningThreadPool(
-    comptime JobT: type,
-    comptime work_f: *const fn (JobT) void,
+    comptime WorkerT: type,
 ) type {
     return struct {
         const Self = @This();
         const QUEUE_CAPACITY: usize = 1024;
 
-        jobs: SPMCQueue(JobT, null, null),
-        workers: std.ArrayList(std.Thread),
-        worker_count: u16,
+        const ThreadWorker = struct {
+            thread: std.Thread,
+            worker: *WorkerT,
+        };
+
+        jobs: SPMCQueue(WorkerT.JobType, null, null),
+
+        _alloc: std.mem.Allocator,
+        _workers: []ThreadWorker,
 
         // Signifies whenever the queue is invoked to be terminated. Worker threads must
         // respect this as quickly asp ossible.
@@ -25,19 +30,8 @@ pub fn SpinningThreadPool(
         // it helps us decide which CPU to pin the thread on.
         thread_counter: std.atomic.Value(usize),
 
-        /// Take one job from the work queue and run it.
-        fn fetchAndDo(self: *Self) void {
-            if (self.jobs.tryPop()) |job| {
-                // Run it.
-                work_f(job);
-                return;
-            }
-
-            sys.spinlockYield();
-        }
-
-        /// Callable invoked by the worker threads.
-        fn tq_worker(self: *Self) void {
+        /// Each consumer thread invokes this function to perform work.
+        fn consumerStart(self: *Self, worker: *WorkerT) void {
             self.jobs.registerConsumer();
 
             // TODO(mvejnovic): This fetchAdd adds 2 because the cores on MY machine
@@ -51,8 +45,14 @@ pub fn SpinningThreadPool(
 
             // We will spin until the parent thread asks us to shut the hell up.
             while (!self.close_event.load(.unordered)) {
-                // Fetch a job, and if one exists...
-                self.fetchAndDo();
+                // Fetch a job and run it if it exists.
+                if (self.jobs.tryPop()) |job| {
+                    // Run it.
+                    worker.work(job);
+                }
+
+                // Tell the CPU we're in a spin-wait.
+                sys.spinlockYield();
             }
         }
 
@@ -65,20 +65,18 @@ pub fn SpinningThreadPool(
 
         pub fn init(
             alloc: std.mem.Allocator,
-            worker_count: u16,
+            workers: []WorkerT,
         ) !Self {
-            var self = Self{
+            const self = Self{
                 // Let us initialize the work queue.
-                .jobs = try SPMCQueue(JobT, null, null).init(
+                .jobs = try SPMCQueue(WorkerT.JobType, null, null).init(
                     alloc,
-                    worker_count,
+                    workers.len,
                     QUEUE_CAPACITY,
                 ),
 
-                // Let's create the workers vector.
-                .workers = std.ArrayList(std.Thread).init(alloc),
-
-                .worker_count = worker_count,
+                ._alloc = alloc,
+                ._workers = try alloc.alloc(ThreadWorker, workers.len),
 
                 .close_event = std.atomic.Value(bool).init(false),
 
@@ -86,22 +84,48 @@ pub fn SpinningThreadPool(
                 // core as the first core.
                 .thread_counter = std.atomic.Value(usize).init(2),
             };
-            try self.workers.ensureTotalCapacity(worker_count);
+
+            for (workers, self._workers) |*worker, *worker_thread| {
+                worker_thread.worker = worker;
+            }
+
             return self;
         }
 
+        /// Close-off all threads and deinitialize memory.
+        pub fn deinit(self: *Self) void {
+            // This would be an unsafe function if we don't terminate it explicitly.
+            // Although the intended usage is for the user to call self.terminate, let
+            // us call it to make sure this .deinit() would be safe for the rest of the
+            // application.
+            self.terminate();
+
+            // We can deallocate the worker memory now as nobody depends on it.
+            self._alloc.free(self._workers);
+
+            // Now that we have very nicely exited each and every worker, nobody should
+            // be contending the jobs and we should be able to free it.
+            self.jobs.deinit();
+        }
+
+        /// Synchronously start all threads. This blocks until all threads are spawned
+        /// and then proceeds.
         pub fn begin(self: *Self) !void {
-            for (0..self.worker_count) |_| {
-                const thread = try std.Thread.spawn(.{}, tq_worker, .{self});
-                try self.workers.append(thread);
+            for (self._workers) |*worker| {
+                const t = try std.Thread.spawn(
+                    .{},
+                    consumerStart,
+                    .{ self, worker.worker },
+                );
+                worker.thread = t;
             }
         }
 
         /// Hostage the current thread to perform work too until the job queue empties
         /// out.
         pub fn blockUntilEmpty(self: *Self) !void {
-            // Treat self similarly to tq_worker, but instead of guarding on the event,
-            // we guard on the size of the queue.
+            // Treat self similarly to consumerStart, but instead of guarding on the
+            // event, we guard on the size of the queue.
             while (self.jobs.len() > 0) {
                 // TODO(mvejnovic): This is kind of crappy because this thread could
                 // also be doing real good work.
@@ -122,34 +146,18 @@ pub fn SpinningThreadPool(
             }
 
             // Don't forget to send the close event because that is what tells the
-            // workers to actually exit.
+            // threads to actually exit.
             self.close_event.store(true, .unordered);
 
             // Then, join on threads. At this point, this should not block as they
             // should exit early.
-            for (self.workers.items) |worker| {
-                worker.join();
+            for (self._workers) |*w| {
+                w.thread.join();
             }
         }
 
-        /// Close-off all threads and deinitialize memory.
-        pub fn deinit(self: *Self) void {
-            // This would be an unsafe function if we don't terminate it explicitly.
-            // Although the intended usage is for the user to call self.terminate, let
-            // us call it to make sure this .deinit() would be safe for the rest of the
-            // application.
-            self.terminate();
-
-            // We can deallocate the worker memory now as nobody depends on it.
-            self.workers.deinit();
-
-            // Now that we have very nicely exited each and every worker, nobody should
-            // be contending the jobs and we should be able to free it.
-            self.jobs.deinit();
-        }
-
-        pub fn enqueue(self: *Self, task: JobT) !void {
-            try self.jobs.push(task, 1 * std.time.ns_per_s);
+        pub fn enqueue(self: *Self, task: WorkerT.JobType) !void {
+            try self.jobs.push(task, null);
         }
     };
 }

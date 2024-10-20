@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const sys = @import("../sys.zig");
 
 fn isPowerOfTwo(comptime n: usize) bool {
     if (n == 0) return false; // 0 is not a power of two
@@ -217,15 +218,22 @@ pub fn SPSCQueue(comptime T: type, comptime comptime_capacity: ?usize) type {
             return val;
         }
 
-        pub fn spinPush(self: *Self, value: T, timeout_ns: u64) !void {
+        pub fn spinPush(self: *Self, value: T, timeout_ns: ?u64) !void {
+            if (timeout_ns == null) {
+                while (!self.push(value)) {
+                    sys.spinlockYield();
+                }
+                return;
+            }
+
             var timer = try std.time.Timer.start();
 
-            while (timer.read() < timeout_ns) {
+            while (timer.read() < timeout_ns.?) {
                 if (self.push(value)) {
                     return;
                 }
 
-                try std.Thread.yield();
+                sys.spinlockYield();
             }
 
             return error.SpinningTimedOut;
@@ -488,7 +496,7 @@ pub fn SPMCQueue(
             return self;
         }
 
-        pub fn push(self: *Self, value: T, timeout_ns: u64) !void {
+        pub fn push(self: *Self, value: T, timeout_ns: ?u64) !void {
             // Note the semantics of the SPSCQueue are not consistent with the
             // semantics of this queue. That queue returns a boolean indicating whether
             // the push was successful or not, but this queue is responsible for

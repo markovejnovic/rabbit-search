@@ -1,6 +1,10 @@
 #include "intr.h"
 #include <pthread.h>
 
+static inline __mmask64 _maskUntil(size_t n) {
+    return (__mmask64)((1ULL << n) - 1ULL);
+}
+
 /**
  *  @brief  Chooses the offsets of the most interesting characters in a search needle.
  *
@@ -88,10 +92,6 @@ struct NeedleParameters compileNeedle(const char* n, size_t n_length) {
     };
 }
 
-__mmask64 _maskUntil(size_t n) {
-    return (__mmask64)((1ULL << n) - 1ULL);
-}
-
 /**
  * @brief  Compares two strings of equal length using AVX512 instructions.
  * @note   The caller is responsible to ensure that the length of the strings
@@ -109,8 +109,7 @@ bool avx512EqualUpTo64(const char* a, const char* b, size_t length) {
     const __m512i a_vec = _mm512_maskz_loadu_epi8(mask, a);
     const __m512i b_vec = _mm512_maskz_loadu_epi8(mask, b);
     const __mmask64 neq = _mm512_mask_cmpneq_epi8_mask(mask, a_vec, b_vec);
-    if (neq != 0) return false;
-    return true;
+    return neq == 0;
 }
 
 /**
