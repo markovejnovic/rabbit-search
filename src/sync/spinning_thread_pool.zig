@@ -4,7 +4,6 @@ const sys = @import("../sys.zig");
 const sysops = @cImport({
     @cInclude("sysops.h");
 });
-const trace = @import("../trace.zig");
 
 pub fn SpinningThreadPool(
     comptime JobT: type,
@@ -34,7 +33,6 @@ pub fn SpinningThreadPool(
                 return;
             }
 
-            trace.evt_worker_wait();
             sys.spinlockYield();
         }
 
