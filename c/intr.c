@@ -142,5 +142,5 @@ bool avx512SearchNeedle(const char* h, size_t h_length, const struct NeedleParam
         matches &= matches - 1;
     }
 
-    return true;
+    return false;
 }
