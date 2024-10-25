@@ -8,6 +8,8 @@ static inline __mmask64 _maskUntil(size_t n) {
 /**
  *  @brief  Chooses the offsets of the most interesting characters in a search needle.
  *
+ *  @note This has been mostly taken from stringzilla.h
+ *
  *  Search throughput can significantly deteriorate if we are matching the wrong characters.
  *  Say the needle is "aXaYa", and we are comparing the first, mid, and last character.
  *  If we use SIMD and compare many offsets at a time, comparing against "a" in every register is a waste.

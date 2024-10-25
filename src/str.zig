@@ -60,10 +60,10 @@ pub fn CompiledSearcher(comptime vector_size_bits: usize) type {
 
         /// Reset the internal state of the searcher. This must be used between
         /// subsequent searches.
-        pub fn reset(self: *const Self) void {
+        pub fn reset(self: *Self) void {
             // 0 out the needle 0..(BatchSize - (needle.len - 1)) bytes to prevent us
             // accidentally finding a substring when no substring really existed.
-            std.mem.set(self._search_buf[(BatchSize - self.needle.len - 1)], 0);
+            @memset(self._search_buf[0..(BatchSize - (self.needle.len - 1))], 0);
         }
 
         /// Query the searcher for the optimal batch size it requires. This value will
@@ -87,22 +87,19 @@ pub fn CompiledSearcher(comptime vector_size_bits: usize) type {
 
         /// Submit a batch of data to the searcher.
         /// The batch represents a unit of work that the searcher will process.
-        /// The batch size must be equal to the value returned by desiredBatchSize.
+        /// The batch size must be equal to the value returned by batchSize.
         pub fn searchInBatch(self: *Self) bool {
-            // TODO(mvejnovic): Fix the fact that this strategy may not work always.
-            // The edge case is when the needle exists at a boundary between subsequent
-            // batches.
             const found: bool = cIntr.avx512SearchNeedle(
                 @ptrCast(&self._search_buf),
                 self._search_buf.len,
                 @ptrCast(&self._needle_params),
             );
 
-            std.mem.copyForwards(
-                u8,
-                &self._search_buf,
-                self._search_buf[(BatchSize - self.needle.len - 1)..],
-            );
+            // Take the last (needle.len - 1) bytes from the search buffer and copy
+            // them back.
+            const out_slice = self._search_buf[0..(self.needle.len - 1)];
+            const in_slice = self._search_buf[(BatchSize - (self.needle.len - 1))..];
+            @memcpy(out_slice, in_slice);
 
             return found;
         }

@@ -149,6 +149,10 @@ pub fn SearchTask() type {
                 return;
             }
 
+            // We need to reset the searcher before we proceed as it might contain some
+            // garbage from the previous file.
+            self._searcher.reset();
+
             // Traverse the file in chunks equal to the optimal size
             while (true) {
                 const batch_size = self._searcher.batchSize();
