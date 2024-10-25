@@ -129,7 +129,7 @@ pub fn SpinningThreadPool(
             while (self.jobs.len() > 0) {
                 // TODO(mvejnovic): This is kind of crappy because this thread could
                 // also be doing real good work.
-                try std.Thread.yield();
+                sys.spinlockYield();
             }
 
             self.terminate();

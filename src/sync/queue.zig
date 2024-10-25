@@ -248,7 +248,7 @@ pub fn SPSCQueue(comptime T: type, comptime comptime_capacity: ?usize) type {
                     return value.?;
                 }
 
-                try std.Thread.yield();
+                sys.spinlockYield();
             }
 
             return error.SpinningTimedOut;
