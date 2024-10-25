@@ -1,5 +1,6 @@
 const std = @import("std");
 const str = @import("str.zig");
+const metrics = @import("metrics.zig");
 
 pub const StringSearchJob = struct {
     const Self = @This();
@@ -48,16 +49,19 @@ pub fn SearchTask() type {
         _searcher: str.CompiledSearcher(512),
         _working_dir_path: []const u8,
         _out_file: std.fs.File,
+        _bandwidth_meter: *metrics.AtomicBandwidth,
 
         pub fn init(
             search_needle: []const u8,
             working_dir_path: []const u8,
             out_file: std.fs.File,
+            bandwidth_meter: *metrics.AtomicBandwidth,
         ) !Self {
             return Self{
                 ._searcher = try str.CompiledSearcher(512).init(search_needle),
                 ._working_dir_path = working_dir_path,
                 ._out_file = out_file,
+                ._bandwidth_meter = bandwidth_meter,
             };
         }
 
@@ -141,6 +145,7 @@ pub fn SearchTask() type {
             };
 
             const file_sz = file_stats.size;
+            self._bandwidth_meter.counter.add(file_sz);
 
             // Easy-case, exit early, we know we won't find shit here.
             // TODO(mvejnovic): Mark unlikely

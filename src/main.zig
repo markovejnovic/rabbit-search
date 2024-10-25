@@ -8,6 +8,7 @@ const sysops = @cImport({
     @cInclude("sysops.h");
 });
 const mp_search = @import("mp_search.zig");
+const metrics = @import("metrics.zig");
 
 pub fn main() !void {
     // TODO(markovejnovic): This allocator needs to be sped up.
@@ -65,6 +66,9 @@ pub fn main() !void {
     std.log.debug("Searching {s}", .{to_search});
     defer gpa.allocator().free(to_search);
 
+    // Prepare the metrics
+    var searchBandwidthMeter = metrics.AtomicBandwidth.init();
+
     // Inintialize workers which will be performing the search.
     const workers = try gpa.allocator().alloc(mp_search.SearchTask(), jobs);
     defer gpa.allocator().free(workers);
@@ -73,6 +77,7 @@ pub fn main() !void {
             args.getSingleValue("NEEDLE").?,
             to_search,
             std.io.getStdOut(),
+            &searchBandwidthMeter,
         );
     }
     defer {
@@ -86,6 +91,7 @@ pub fn main() !void {
         gpa.allocator(),
         workers,
     );
+    searchBandwidthMeter.start();
     try thread_pool.begin();
     defer thread_pool.deinit();
 
@@ -114,4 +120,9 @@ pub fn main() !void {
     // This is critical because we need to prevent the memory allocated by fs_walker to
     // be deallocated prematurely.
     try thread_pool.blockUntilEmpty();
+
+    std.log.err(
+        "Search bandwidth {d:.2}MB/sec",
+        .{searchBandwidthMeter.get() / 1024 / 1024},
+    );
 }
