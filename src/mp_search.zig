@@ -46,7 +46,7 @@ pub fn SearchTask() type {
 
         const Self = @This();
 
-        _searcher: str.CompiledSearcher(512),
+        _searcher: str.WideCompiledSearcher(),
         _working_dir_path: []const u8,
         _out_file: std.fs.File,
         _bandwidth_meter: *metrics.AtomicBandwidth,
@@ -58,7 +58,7 @@ pub fn SearchTask() type {
             bandwidth_meter: *metrics.AtomicBandwidth,
         ) !Self {
             return Self{
-                ._searcher = try str.CompiledSearcher(512).init(search_needle),
+                ._searcher = try str.WideCompiledSearcher().init(search_needle),
                 ._working_dir_path = working_dir_path,
                 ._out_file = out_file,
                 ._bandwidth_meter = bandwidth_meter,
@@ -154,47 +154,39 @@ pub fn SearchTask() type {
                 return;
             }
 
+            const data = std.posix.mmap(
+                null,
+                file_stats.size,
+                std.posix.PROT.READ,
+                .{
+                    .HUGETLB = false,
+                    .POPULATE = true,
+                    .TYPE = .PRIVATE,
+                },
+                file.handle,
+                0,
+            ) catch |err| {
+                std.log.err("Could not mmap() {} due to {}", .{ job, err });
+                return;
+            };
+            defer std.posix.munmap(data);
+
+            std.posix.madvise(
+                data.ptr,
+                file_stats.size,
+                std.posix.MADV.SEQUENTIAL | std.posix.MADV.WILLNEED,
+            ) catch |err| {
+                std.log.warn("Could not madvise() {} due to {}.", .{ job, err });
+            };
+
             // We need to reset the searcher before we proceed as it might contain some
             // garbage from the previous file.
             self._searcher.reset();
 
             // Traverse the file in chunks equal to the optimal size
-            while (true) {
-                const bytes_read = file.read(self._searcher.writeSlice()) catch |err| {
-                    std.log.err(
-                        "Unexpected error occurred reading {any}: {any}",
-                        .{ file_path.?, err },
-                    );
-                    return;
-                };
-
-                if (bytes_read < self._searcher.writeSlice().len) {
-                    // We read less bytes than the read buffer. If we have not exited the
-                    // function by now, let's submit the last batch and call it a day.
-                    // TODO(mvejnovic): This block is duplicated.
-                    // TODO(mvejnovic): Mark unlikely
-                    std.log.debug("Read {} bytes out of {} batch. Terminating search.", .{
-                        bytes_read,
-                        self._searcher.writeSlice().len,
-                    });
-                    if (self._searcher.searchInBatch()) {
-                        self._out_file.writer().print("{s}\n", .{file_path.?}) catch {};
-                    }
-                    return;
-                }
-
-                // Otherwise, we've read 256 bytes exactly. Lucky us. Let's submit the batch
-                // and, if that batch returns anything, means we've found our guy.
-                // TODO(mvejnovic): This block is duplicated.
-                // TODO(mvejnovic): Mark unlikely
-                if (self._searcher.searchInBatch()) {
-                    self._out_file.writer().print("{s}\n", .{file_path.?}) catch {};
-                    // We found our character, let's exit early.
-                    return;
-                }
-
-                // If the batch doesn't find anything, read some more in hopes we'll find
-                // something.
+            if (self._searcher.search(data)) {
+                // TODO(mvejnovic): Output to queue.
+                self._out_file.writer().print("{s}\n", .{file_path.?}) catch {};
             }
         }
     };

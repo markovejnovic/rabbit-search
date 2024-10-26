@@ -96,3 +96,60 @@ pub fn CompiledSearcher(comptime vector_size_bits: usize) type {
         }
     };
 }
+
+pub fn WideCompiledSearcher() type {
+    return struct {
+        // TODO(mvejnovic): Support processors without AVX512 (which is most things).
+
+        const Self = @This();
+
+        /// Stores the needle value.
+        /// I chose to hold the actual value within the searcher object as each thread
+        /// will have its own searcher object. Aiming to improve cache locality.
+        // TODO(mvejnovic): Benchmark this statement. Also the current implementation
+        // does the opposite LOL.
+        needle: []const u8,
+        _needle_params: cIntr.NeedleParameters,
+
+        /// Initialize the searcher with a needle.
+        ///
+        /// Note that this searcher is not thread-safe. Each thread must have its own
+        /// searcher object. The searcher object is NOT cheap to create.
+        pub fn init(needle: []const u8) !Self {
+            if (needle[0] == needle[needle.len - 1]) {
+                // TODO(mvejnovic): Implement better handling for when the needle head
+                // and tail are equal.
+                std.log.warn(
+                    "Your needle's first and last characters are equal. This has a performance penalty.",
+                    .{},
+                );
+            }
+
+            const self = Self{
+                .needle = needle,
+                ._needle_params = cIntr.compileNeedle(@ptrCast(needle.ptr), needle.len),
+            };
+
+            return self;
+        }
+
+        pub fn deinit(self: *const Self) void {
+            _ = self;
+        }
+
+        /// Reset the internal state of the searcher. This must be used between
+        /// subsequent searches.
+        pub fn reset(self: *Self) void {
+            _ = self;
+        }
+
+        pub fn search(self: *Self, data: []const u8) bool {
+            const found: bool = cIntr.avx512SearchNeedle(
+                @ptrCast(data.ptr),
+                data.len,
+                &self._needle_params,
+            );
+            return found;
+        }
+    };
+}

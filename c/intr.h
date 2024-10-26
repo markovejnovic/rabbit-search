@@ -7,7 +7,7 @@
 #include <stdlib.h>
 
 static inline __mmask64 _maskUntil(size_t n) {
-    return (__mmask64)((1ULL << n) - 1ULL);
+    return _bzhi_u64(0xFFFFFFFFFFFFFFFF, (uint32_t)n);
 }
 
 struct NeedleOffsets {
@@ -140,6 +140,31 @@ static inline bool avx512EqualUpTo64(const char* a, const char* b, size_t length
     const __m512i b_vec = _mm512_maskz_loadu_epi8(mask, b);
     const __mmask64 neq = _mm512_mask_cmpneq_epi8_mask(mask, a_vec, b_vec);
     return neq == 0;
+}
+
+static inline bool avx512Equal(const char* a, const char* b, size_t length) {
+    __mmask64 mask;
+    __m512i a_vec = _mm512_maskz_loadu_epi8(mask, a);
+    __m512i b_vec = _mm512_maskz_loadu_epi8(mask, b);
+
+    while (length >= 64) {
+        a_vec = _mm512_loadu_si512(a);
+        b_vec = _mm512_loadu_si512(b);
+        mask = _mm512_cmpneq_epi8_mask(a_vec, b_vec);
+        if (mask != 0) return false;
+        a += 64, b += 64, length -= 64;
+    }
+
+    if (length) {
+        mask = _maskUntil(length);
+        a_vec = _mm512_maskz_loadu_epi8(mask, a);
+        b_vec = _mm512_maskz_loadu_epi8(mask, b);
+        // Reuse the same `mask` variable to find the bit that doesn't match
+        mask = _mm512_mask_cmpneq_epi8_mask(mask, a_vec, b_vec);
+        return mask == 0;
+    } else {
+        return true;
+    }
 }
 
 bool avx512SearchNeedle(const char* h, size_t h_length,
