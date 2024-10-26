@@ -160,9 +160,7 @@ pub fn SearchTask() type {
 
             // Traverse the file in chunks equal to the optimal size
             while (true) {
-                const batch_size = self._searcher.batchSize();
-
-                const bytes_read = file.read(self._searcher.writePointer()) catch |err| {
+                const bytes_read = file.read(self._searcher.writeSlice()) catch |err| {
                     std.log.err(
                         "Unexpected error occurred reading {any}: {any}",
                         .{ file_path.?, err },
@@ -170,14 +168,14 @@ pub fn SearchTask() type {
                     return;
                 };
 
-                if (bytes_read < batch_size) {
+                if (bytes_read < self._searcher.writeSlice().len) {
                     // We read less bytes than the read buffer. If we have not exited the
                     // function by now, let's submit the last batch and call it a day.
                     // TODO(mvejnovic): This block is duplicated.
                     // TODO(mvejnovic): Mark unlikely
                     std.log.debug("Read {} bytes out of {} batch. Terminating search.", .{
                         bytes_read,
-                        batch_size,
+                        self._searcher.writeSlice().len,
                     });
                     if (self._searcher.searchInBatch()) {
                         self._out_file.writer().print("{s}\n", .{file_path.?}) catch {};

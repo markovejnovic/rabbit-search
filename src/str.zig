@@ -66,20 +66,11 @@ pub fn CompiledSearcher(comptime vector_size_bits: usize) type {
             @memset(self._search_buf[0..(BatchSize - (self.needle.len - 1))], 0);
         }
 
-        /// Query the searcher for the optimal batch size it requires. This value will
-        /// settle after initialization and is legal to invoke after .init().
-        ///
-        /// The batch size is determined by a combination of the needle length and the
-        /// BatchSize constant.
-        pub fn batchSize(self: *const Self) usize {
-            return BatchSize - (self.needle.len - 1);
-        }
-
         /// Retrieve a pointer to the internal search buffer. This search buffer is
         /// legal to write to after the searcher has been initialized. The caller is
         /// responsible for calling searchInBatch after populating buffer with
         /// batchSize() bytes.
-        pub fn writePointer(self: *Self) []u8 {
+        pub fn writeSlice(self: *Self) []u8 {
             // The first 0..(BatchSize - (needle.len - 1)) bytes are reserved for the
             // previous batch data which may in-fact contain the needle.
             return self._search_buf[(self.needle.len - 1)..];
