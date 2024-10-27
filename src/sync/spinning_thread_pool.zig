@@ -156,8 +156,8 @@ pub fn SpinningThreadPool(
             }
         }
 
-        pub fn enqueue(self: *Self, task: WorkerT.JobType) !void {
-            try self.jobs.push(task, null);
+        pub fn enqueue(self: *Self, task: WorkerT.JobType) void {
+            self.jobs.spinPush(task);
         }
     };
 }

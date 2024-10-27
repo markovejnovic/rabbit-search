@@ -135,16 +135,32 @@ pub fn SearchTask() type {
             //   - Do not search if the file appears to be a binary file.
             //   - Do not search if the file is in a .gitignore
 
-            const file = std.fs.openFileAbsolute(file_path.?, .{}) catch |err| {
-                std.log.err("Could not open {} due to {}", .{ job, err });
+            const posix_path = std.posix.toPosixPath(file_path.?) catch |err| {
+                std.log.err(
+                    "Could not convert {s} to posix path due to {}",
+                    .{ file_path.?, err },
+                );
                 return;
             };
-            const file_stats = file.stat() catch |err| {
-                std.log.err("Could not stat() {} due to {}", .{ job, err });
+            const file_fd = std.c.open(
+                &posix_path,
+                .{
+                    .ACCMODE = .RDONLY,
+                    .DIRECT = false,
+                },
+            );
+            if (file_fd == -1) {
+                std.log.err("Could not open file {s}", .{file_path.?});
                 return;
-            };
+            }
+            defer _ = std.c.close(file_fd);
 
-            const file_sz = file_stats.size;
+            var file_stats: std.os.linux.Stat = undefined;
+            if (std.c.fstat(file_fd, &file_stats) == -1) {
+                std.log.err("Could not fstat() {s}", .{posix_path});
+            }
+
+            const file_sz: u64 = @intCast(file_stats.size);
             self._bandwidth_meter.counter.add(file_sz);
 
             // Easy-case, exit early, we know we won't find shit here.
@@ -154,16 +170,18 @@ pub fn SearchTask() type {
                 return;
             }
 
+            // TODO(mvejnovic): Is there any benefit in doing an fadvise()?
+
             const data = std.posix.mmap(
                 null,
-                file_stats.size,
+                file_sz,
                 std.posix.PROT.READ,
                 .{
                     .HUGETLB = false,
                     .POPULATE = true,
                     .TYPE = .PRIVATE,
                 },
-                file.handle,
+                file_fd,
                 0,
             ) catch |err| {
                 std.log.err("Could not mmap() {} due to {}", .{ job, err });
@@ -173,7 +191,7 @@ pub fn SearchTask() type {
 
             std.posix.madvise(
                 data.ptr,
-                file_stats.size,
+                file_sz,
                 std.posix.MADV.SEQUENTIAL | std.posix.MADV.WILLNEED,
             ) catch |err| {
                 std.log.warn("Could not madvise() {} due to {}.", .{ job, err });

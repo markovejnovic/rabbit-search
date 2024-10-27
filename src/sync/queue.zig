@@ -12,16 +12,15 @@ fn intln2(comptime n: anytype) @TypeOf(n) {
 }
 
 /// Note that this function does not sanitize comptime_capacity nor capacity
-fn cyclicalIdx(index: usize, comptime comptime_capacity: ?usize, capacity: ?usize) usize {
+fn cyclicalIdx(index: usize, increment: usize, comptime comptime_capacity: ?usize, capacity: ?usize) usize {
     if (comptime_capacity != null and isPowerOfTwo(comptime_capacity.?)) {
         // This and trick is equivalent to performing the modulo operation for
         // powers of two.
         const mask = comptime_capacity.? - 1;
 
-        return (index + 1) & mask;
+        return (index + increment) & mask;
     } else {
-        var next_read_idx: usize = undefined;
-        next_read_idx = index + 1;
+        var next_read_idx: usize = index + increment;
         if (next_read_idx == capacity) {
             next_read_idx = 0;
         }
@@ -178,7 +177,7 @@ pub fn SPSCQueue(comptime T: type, comptime comptime_capacity: ?usize) type {
 
         pub fn push(self: *Self, value: T) bool {
             const write_idx = self.write_idx.load(.monotonic);
-            const next_write_idx = cyclicalIdx(write_idx, comptime_capacity, self.capacity);
+            const next_write_idx = cyclicalIdx(write_idx, 1, comptime_capacity, self.capacity);
 
             if (next_write_idx == self.read_idx_cache) {
                 // If the indices are the same, the read_idx_cache is now out of date.
@@ -211,7 +210,7 @@ pub fn SPSCQueue(comptime T: type, comptime comptime_capacity: ?usize) type {
             // Because capacity may be comptime
             const read_idx = self.read_idx.load(.monotonic);
             self.read_idx.store(
-                cyclicalIdx(read_idx, comptime_capacity, self.capacity),
+                cyclicalIdx(read_idx, 1, comptime_capacity, self.capacity),
                 .release,
             );
 
@@ -449,7 +448,7 @@ pub fn SPMCQueue(
         threadlocal var consumer_idx: usize = undefined;
 
         queues: std.ArrayList(SPSC),
-        push_idx: std.atomic.Value(usize),
+        push_idx: usize,
         rolling_consumer_idx: std.atomic.Value(usize),
 
         pub fn init(
@@ -483,7 +482,7 @@ pub fn SPMCQueue(
                     allocator,
                     desired_queue_count,
                 ),
-                .push_idx = std.atomic.Value(usize).init(0),
+                .push_idx = 0,
                 .rolling_consumer_idx = std.atomic.Value(usize).init(0),
             };
 
@@ -496,21 +495,24 @@ pub fn SPMCQueue(
             return self;
         }
 
-        pub fn push(self: *Self, value: T, timeout_ns: ?u64) !void {
+        pub fn spinPush(self: *Self, value: T) void {
             // Note the semantics of the SPSCQueue are not consistent with the
             // semantics of this queue. That queue returns a boolean indicating whether
             // the push was successful or not, but this queue is responsible for
             // waiting.
-            const push_idx = self.push_idx.load(.monotonic);
+            while (true) {
+                var relevant_queue: *SPSC = &self.queues.items[self.push_idx];
+                if (relevant_queue.push(value)) {
+                    return;
+                }
 
-            var relevant_queue: *SPSC = &self.queues.items[push_idx];
-            try relevant_queue.spinPush(value, timeout_ns);
-            const new_idx = cyclicalIdx(
-                push_idx,
-                comptime_queue_count,
-                self.queues.capacity,
-            );
-            self.push_idx.store(new_idx, .monotonic);
+                self.push_idx = cyclicalIdx(
+                    self.push_idx,
+                    1,
+                    comptime_queue_count,
+                    self.queues.capacity,
+                );
+            }
         }
 
         pub fn pop(self: *Self, timeout_ns: u64) !T {

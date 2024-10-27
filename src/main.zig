@@ -114,7 +114,7 @@ pub fn main() !void {
     defer fs_walker.deinit();
 
     while (try fs_walker.next()) |inode| {
-        try thread_pool.enqueue(try mp_search.StringSearchJob.init(&inode, gpa.allocator()));
+        thread_pool.enqueue(try mp_search.StringSearchJob.init(&inode, gpa.allocator()));
     }
 
     // This is critical because we need to prevent the memory allocated by fs_walker to
