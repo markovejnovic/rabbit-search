@@ -5,18 +5,44 @@ const builtin = @import("builtin");
 const sysops = @cImport({
     @cInclude("sysops.h");
 });
-const queue = @import("queue.zig");
+const stack = @import("stack.zig");
 
 extern threadlocal var errno: c_int;
 
 pub fn SpscChannel(T: type) type {
     return struct {
-        const Type = T;
-        const QueueT = queue.BatchedQueue(Type, 1024);
+        const Self = @This();
 
-        queue: QueueT,
-        done_flag: std.atomic.Value(bool),
+        const Type = T;
+        // We choose to use a stack here because, although a queue would be "more
+        // correct", in our particular application we do not care about the order
+        // elements are processed as long as they are processed. The stack is slightly
+        // faster as the ideal, lock-free implementation only requires one atomic while
+        // the Queue requires two atomics. The former allows for slightly less
+        // contention.
+        const StackT = stack.SPSCChan(Type, 256, 4);
+
+        stack: StackT,
         alloc: std.mem.Allocator,
+
+        _done_flag: std.atomic.Value(bool),
+
+        pub fn isClosed(self: *const Self) bool {
+            return self._done_flag.load(.monotonic);
+        }
+
+        pub fn close(self: *Self) void {
+            self.stack.close();
+            self._done_flag.store(true, .release);
+        }
+
+        // TODO(mvejnovic): This whole function is a disgusting hack and I'm ashamed of
+        // myself. The only reason it exists is so that we can observe the settling in
+        // close() .release storage. It would be good if I could wrap this in some sort
+        // of context or something, I don't know...
+        pub fn consumerPostClose(self: *Self) void {
+            _ = self._done_flag.load(.acquire);
+        }
     };
 }
 
@@ -29,6 +55,7 @@ const FsTraverseWorker = struct {
 
     _egress: *EgressT,
     _start_path: []const u8,
+    _fs_walker: ?std.fs.Dir.Walker,
 
     pub fn init(
         egress: *EgressT,
@@ -37,7 +64,14 @@ const FsTraverseWorker = struct {
         return Self{
             ._egress = egress,
             ._start_path = start_path,
+            ._fs_walker = null,
         };
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self._fs_walker) |*walker| {
+            walker.deinit();
+        }
     }
 
     pub fn run(self: *Self) !void {
@@ -53,9 +87,9 @@ const FsTraverseWorker = struct {
         var root = try std.fs.openDirAbsolute(root_path, .{ .iterate = true });
         defer root.close();
 
-        var fs_walker = try root.walk(self._egress.alloc);
+        self._fs_walker = try root.walk(self._egress.alloc);
 
-        while (try fs_walker.next()) |inode| {
+        while (try self._fs_walker.?.next()) |inode| {
             switch (inode.kind) {
                 .file => {
                     if (std.fs.path.joinZ(self._egress.alloc, &[_][]const u8{
@@ -63,7 +97,7 @@ const FsTraverseWorker = struct {
                         inode.path,
                     })) |file_path| {
                         const x = FilePathChannel.Type{ .file_path = file_path };
-                        self._egress.queue.push(x);
+                        self._egress.stack.push(x);
                         std.log.debug("FsTraverseWorker.produce {s}", .{x.file_path});
                     } else |err| {
                         std.log.err("Failed to join path: {}", .{err});
@@ -74,10 +108,8 @@ const FsTraverseWorker = struct {
             }
         }
 
-        self._egress.done_flag.store(true, .monotonic);
+        self._egress.close();
         std.log.debug("FsTraverseWorker done.", .{});
-
-        // TODO(mvejnovic): Deinit fs_walker, the child thread must be done first.
     }
 };
 
@@ -88,11 +120,17 @@ const MemoryLoaderWorker = struct {
 
     _ingress: *IngressChannel,
     _egress: *EgressChannel,
+    _needle_len: usize,
 
-    pub fn init(ingress: *IngressChannel, egress: *EgressChannel) !Self {
+    pub fn init(
+        ingress: *IngressChannel,
+        egress: *EgressChannel,
+        needle_len: usize,
+    ) !Self {
         return Self{
             ._ingress = ingress,
             ._egress = egress,
+            ._needle_len = needle_len,
         };
     }
 
@@ -101,21 +139,33 @@ const MemoryLoaderWorker = struct {
         _ = sysops.pinThreadToCore(@intCast(2));
 
         // While the producer is not done, keep loading files into memory.
-        while (!self._ingress.done_flag.load(.monotonic)) {
+        while (!self._ingress.isClosed()) {
             // We read in batches, so let's read the batch and process it.
-            const work_unit: IngressChannel.Type = self._ingress.queue.pop();
-            defer self._ingress.alloc.free(work_unit.file_path);
-            if (self._processJob(work_unit)) |out| {
-                self._egress.queue.push(out);
-            } else |err| {
-                std.log.err("Failed to process job: {}", .{err});
+            self._processJob(self._ingress.stack.pop());
+        }
+
+        // There might still be some stragglers in the stack, so let's process them.
+        self._ingress.consumerPostClose();
+        while (true) {
+            const maybe_job = self._ingress.stack.tryThreadUnsafePop();
+            if (maybe_job) |job| {
+                self._processJob(job);
+            } else {
+                break;
             }
         }
 
-        self._egress.done_flag.store(true, .monotonic);
+        // Close out the queue.
+        self._egress.close();
+        // We also need to ensure we unblock any threads that may be waiting on the
+        // stack.
+        std.log.debug("MemoryLoaderWorker done.", .{});
     }
 
-    fn _processJob(self: *Self, job: IngressChannel.Type) !EgressChannel.Type {
+    fn _processJob(self: *Self, job: IngressChannel.Type) void {
+        // We need to make sure after all is set and done that we free the memory.
+        defer self._ingress.alloc.free(job.file_path);
+
         // This thread is responsible for loading the file into memory.
         std.log.debug("MemoryLoaderWorker._processJob({s})", .{job.file_path});
         const file_path = job.file_path;
@@ -126,7 +176,7 @@ const MemoryLoaderWorker = struct {
         if (file_fd == -1) {
             // TODO(mvejnovic): Write the errno.
             std.log.err("Failed to open file: {s}", .{file_path});
-            return error.FailToOpen;
+            return;
         }
         defer _ = std.c.close(file_fd);
 
@@ -135,26 +185,39 @@ const MemoryLoaderWorker = struct {
         if (std.c.fstat(file_fd, &file_stat) == -1) {
             // TODO(mvejnovic): Write the errno.
             std.log.err("Failed to fstat file: {s}", .{file_path});
-            return error.FailToStat;
+            return;
+        }
+
+        if (file_stat.size < self._needle_len) {
+            // If the file is smaller than the needle, there is no point in attempting
+            // to read it.
+            return;
         }
 
         // Allocate a buffer to read the file into memory.
-        const memory: []u8 = self._egress.alloc.alloc(u8, @intCast(file_stat.size)) catch |err| {
-            std.log.err(
-                "Failed to allocate memory for file: {s}: {}",
-                .{ file_path, err },
-            );
-            return error.NotEnoughMemory;
-        };
+        var memory: []u8 = undefined;
+        while (true) {
+            const maybe_mem = self._egress.alloc.alloc(u8, @intCast(file_stat.size));
+            if (maybe_mem) |mem| {
+                memory = mem;
+                break;
+            } else |err| {
+                std.log.err(
+                    "Failed to allocate memory for file: {s}: {}",
+                    .{ file_path, err },
+                );
+            }
+        }
 
         // Read the file into memory.
         if (std.c.read(file_fd, @ptrCast(memory.ptr), memory.len) == -1) {
             // TODO(mvejnovic): errno
             std.log.err("Failed to read file {s}: {}", .{ file_path, errno });
-            return error.FailedToRead;
+            return;
         }
 
-        return EgressChannel.Type{ .memory = memory };
+        std.log.debug("MemoryLoaderWorker.produce {}", .{memory.len});
+        self._egress.stack.push(MemorySearchChannel.Type{ .memory = memory });
     }
 };
 
@@ -173,20 +236,26 @@ const FileSearcherWorker = struct {
         _ = sysops.pinThreadToCore(@intCast(4));
 
         // While the producer is not done, keep loading files into memory.
-        while (!self._ingress.done_flag.load(.monotonic)) {
-            const work_unit: IngressChannel.Type = self._ingress.queue.pop();
-            defer self._ingress.alloc.free(work_unit.memory);
-
-            self._processJob(work_unit);
+        while (!self._ingress.isClosed()) {
+            self._processJob(self._ingress.stack.pop());
         }
+
+        self._ingress.consumerPostClose();
+        while (true) {
+            const maybe_job = self._ingress.stack.tryThreadUnsafePop();
+            if (maybe_job) |job| {
+                self._processJob(job);
+            } else {
+                break;
+            }
+        }
+
+        std.log.debug("FileSearcherWorker done.", .{});
     }
 
     fn _processJob(self: *Self, job: IngressChannel.Type) void {
-        // This thread is responsible for actually searching the memory.
-        const memory: []u8 = job.memory;
-
-        _ = self;
-        _ = memory;
+        std.log.debug("FileSearcherWorker.consume {}", .{job.memory.len});
+        defer self._ingress.alloc.free(job.memory);
     }
 };
 
@@ -246,30 +315,46 @@ pub fn main() !void {
     const max_lim = (try std.posix.getrlimit(.NOFILE)).max;
     try std.posix.setrlimit(.NOFILE, .{ .cur = max_lim, .max = max_lim });
 
-    // Spin up the queues and the workers.
+    // Parse out the needle.
+    const needle = args.getSingleValue("NEEDLE").?;
+
+    // Spin up the stacks and the workers.
     var file_path_channel = FilePathChannel{
-        .queue = try FilePathChannel.QueueT.init("file_path_channel"),
-        .done_flag = std.atomic.Value(bool).init(false),
+        .stack = FilePathChannel.StackT.init("file_path_channel"),
+        ._done_flag = std.atomic.Value(bool).init(false),
         .alloc = gpa.allocator(),
     };
 
+    // 512MB of memory for the memory search channel.
+    // TODO(mvejnovic): This is a hack. Make it configurable.
+    const file_data_pen = try gpa.allocator().alloc(u8, 4 * 1024 * 1024 * 1024);
+    defer gpa.allocator().free(file_data_pen);
+    var file_data_alloc = std.heap.FixedBufferAllocator.init(file_data_pen);
+
     var memory_search_channel = MemorySearchChannel{
-        .queue = try MemorySearchChannel.QueueT.init("memory_search_channel"),
-        .done_flag = std.atomic.Value(bool).init(false),
-        .alloc = gpa.allocator(),
+        .stack = MemorySearchChannel.StackT.init("memory_search_channel"),
+        ._done_flag = std.atomic.Value(bool).init(false),
+        .alloc = file_data_alloc.allocator(),
     };
 
     var fs_traverser_worker = try FsTraverseWorker.init(&file_path_channel, search_dir);
-    var memory_loader_worker = try MemoryLoaderWorker.init(&file_path_channel, &memory_search_channel);
+    var memory_loader_worker = try MemoryLoaderWorker.init(
+        &file_path_channel,
+        &memory_search_channel,
+        needle.len,
+    );
     var file_searcher_worker = try FileSearcherWorker.init(&memory_search_channel);
 
     // Spawn the threads.
-    const t1 = try std.Thread.spawn(.{}, MemoryLoaderWorker.run, .{&memory_loader_worker});
-    const t2 = try std.Thread.spawn(.{}, FileSearcherWorker.run, .{&file_searcher_worker});
+    const memory_thread = try std.Thread.spawn(.{}, MemoryLoaderWorker.run, .{&memory_loader_worker});
+    const searcher_thread = try std.Thread.spawn(.{}, FileSearcherWorker.run, .{&file_searcher_worker});
 
     // The current thread will be the filesystem traverser.
     try fs_traverser_worker.run();
 
-    t1.join();
-    t2.join();
+    std.log.debug("Waiting for threads to finish...", .{});
+    searcher_thread.join();
+    memory_thread.join();
+
+    fs_traverser_worker.deinit();
 }
