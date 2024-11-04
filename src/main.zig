@@ -47,7 +47,9 @@ pub fn SpscChannel(T: type) type {
 }
 
 const FilePathChannel = SpscChannel(struct { file_path: [:0]const u8 });
-const MemorySearchChannel = SpscChannel(struct { memory: []u8 });
+const MemorySearchChannel = SpscChannel(struct {
+    mmap_memory: []align(std.mem.page_size) u8,
+});
 
 const FsTraverseWorker = struct {
     const Self = @This();
@@ -172,7 +174,7 @@ const MemoryLoaderWorker = struct {
 
         // Open the file in direct mode.
         // TODO(mvejnovic): Figure out if .DIRECT = true is good
-        const file_fd = std.c.open(file_path, .{ .ACCMODE = .RDONLY, .DIRECT = false });
+        const file_fd = std.c.open(file_path, .{ .ACCMODE = .RDONLY });
         if (file_fd == -1) {
             // TODO(mvejnovic): Write the errno.
             std.log.err("Failed to open file: {s}", .{file_path});
@@ -194,30 +196,34 @@ const MemoryLoaderWorker = struct {
             return;
         }
 
+        const size_to_load: usize = @intCast(file_stat.size);
+        _ = std.os.linux.fadvise(file_fd, 0, file_stat.size, std.os.linux.POSIX_FADV.NOREUSE);
+
         // Allocate a buffer to read the file into memory.
-        var memory: []u8 = undefined;
-        while (true) {
-            const maybe_mem = self._egress.alloc.alloc(u8, @intCast(file_stat.size));
-            if (maybe_mem) |mem| {
-                memory = mem;
-                break;
-            } else |err| {
-                std.log.err(
-                    "Failed to allocate memory for file: {s}: {}",
-                    .{ file_path, err },
-                );
-            }
-        }
-
-        // Read the file into memory.
-        if (std.c.read(file_fd, @ptrCast(memory.ptr), memory.len) == -1) {
-            // TODO(mvejnovic): errno
-            std.log.err("Failed to read file {s}: {}", .{ file_path, errno });
+        const file_map = std.posix.mmap(
+            null,
+            size_to_load,
+            std.os.linux.PROT.READ,
+            .{
+                .TYPE = .PRIVATE,
+            },
+            file_fd,
+            0,
+        ) catch |err| {
+            std.log.err("Failed to mmap file: {s}: {}", .{ file_path, err });
             return;
-        }
+        };
 
-        std.log.debug("MemoryLoaderWorker.produce {}", .{memory.len});
-        self._egress.stack.push(MemorySearchChannel.Type{ .memory = memory });
+        std.posix.madvise(
+            file_map.ptr,
+            size_to_load,
+            std.posix.MADV.SEQUENTIAL | std.posix.MADV.WILLNEED | std.posix.MADV.DONTFORK,
+        ) catch |err| {
+            std.log.err("Failed to madvise file: {s}: {}", .{ file_path, err });
+        };
+
+        std.log.debug("MemoryLoaderWorker.produce {}", .{file_map.len});
+        self._egress.stack.push(MemorySearchChannel.Type{ .mmap_memory = file_map });
     }
 };
 
@@ -254,8 +260,9 @@ const FileSearcherWorker = struct {
     }
 
     fn _processJob(self: *Self, job: IngressChannel.Type) void {
-        std.log.debug("FileSearcherWorker.consume {}", .{job.memory.len});
-        defer self._ingress.alloc.free(job.memory);
+        std.log.debug("FileSearcherWorker.consume {}", .{job.mmap_memory.len});
+        std.posix.munmap(job.mmap_memory);
+        _ = self;
     }
 };
 
@@ -318,11 +325,16 @@ pub fn main() !void {
     // Parse out the needle.
     const needle = args.getSingleValue("NEEDLE").?;
 
+    // 256M is fine.
+    // TODO(mvejnovic): This is a hack. Make it configurable.
+    const file_path_pen = try gpa.allocator().alloc(u8, 1024 * 1024 * 256);
+    var file_path_alloc = std.heap.FixedBufferAllocator.init(file_path_pen);
+
     // Spin up the stacks and the workers.
     var file_path_channel = FilePathChannel{
         .stack = FilePathChannel.StackT.init("file_path_channel"),
         ._done_flag = std.atomic.Value(bool).init(false),
-        .alloc = gpa.allocator(),
+        .alloc = file_path_alloc.allocator(),
     };
 
     // 512MB of memory for the memory search channel.
