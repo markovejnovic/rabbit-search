@@ -62,6 +62,13 @@ pub fn Queue(comptime T: type) type {
             try q.els.append(val);
         }
 
+        pub fn pushSlice(self: *Self, values: []const T) !void {
+            self.lock.lock();
+            defer self.lock.unlock();
+
+            try self.els.appendSlice(values);
+        }
+
         pub fn len(self: *const Self) usize {
             return self.els.items.len;
         }

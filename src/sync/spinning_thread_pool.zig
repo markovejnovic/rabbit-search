@@ -151,5 +151,9 @@ pub fn SpinningThreadPool(
         pub fn enqueue(self: *Self, task: JobT) !void {
             try self.jobs.push(task, 1 * std.time.ns_per_s);
         }
+
+        pub fn enqueueSlice(self: *Self, tasks: []const JobT) !void {
+            try self.jobs.pushSlice(tasks);
+        }
     };
 }
