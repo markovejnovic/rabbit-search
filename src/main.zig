@@ -5,6 +5,9 @@ const builtin = @import("builtin");
 const sysops = @cImport({
     @cInclude("sysops.h");
 });
+const intr = @cImport({
+    @cInclude("intr.h");
+});
 const stack = @import("stack.zig");
 
 extern threadlocal var errno: c_int;
@@ -23,7 +26,6 @@ pub fn SpscChannel(T: type) type {
         const StackT = stack.SPSCChan(Type, 256, 4);
 
         stack: StackT,
-        alloc: std.mem.Allocator,
 
         _done_flag: std.atomic.Value(bool),
 
@@ -49,6 +51,7 @@ pub fn SpscChannel(T: type) type {
 const FilePathChannel = SpscChannel(struct { file_path: [:0]const u8 });
 const MemorySearchChannel = SpscChannel(struct {
     mmap_memory: []align(std.mem.page_size) u8,
+    file_path: [:0]const u8,
 });
 
 const FsTraverseWorker = struct {
@@ -58,15 +61,18 @@ const FsTraverseWorker = struct {
     _egress: *EgressT,
     _start_path: []const u8,
     _fs_walker: ?std.fs.Dir.Walker,
+    _alloc: std.mem.Allocator,
 
     pub fn init(
         egress: *EgressT,
         start_path: []const u8,
+        alloc: std.mem.Allocator,
     ) !Self {
         return Self{
             ._egress = egress,
             ._start_path = start_path,
             ._fs_walker = null,
+            ._alloc = alloc,
         };
     }
 
@@ -81,20 +87,20 @@ const FsTraverseWorker = struct {
         _ = sysops.pinThreadToCore(@intCast(0));
 
         const root_path = try std.fs.cwd().realpathAlloc(
-            self._egress.alloc,
+            self._alloc,
             self._start_path,
         );
-        defer self._egress.alloc.free(root_path);
+        defer self._alloc.free(root_path);
 
         var root = try std.fs.openDirAbsolute(root_path, .{ .iterate = true });
         defer root.close();
 
-        self._fs_walker = try root.walk(self._egress.alloc);
+        self._fs_walker = try root.walk(self._alloc);
 
         while (try self._fs_walker.?.next()) |inode| {
             switch (inode.kind) {
                 .file => {
-                    if (std.fs.path.joinZ(self._egress.alloc, &[_][]const u8{
+                    if (std.fs.path.joinZ(self._alloc, &[_][]const u8{
                         root_path,
                         inode.path,
                     })) |file_path| {
@@ -123,16 +129,19 @@ const MemoryLoaderWorker = struct {
     _ingress: *IngressChannel,
     _egress: *EgressChannel,
     _needle_len: usize,
+    _allocator: std.mem.Allocator,
 
     pub fn init(
         ingress: *IngressChannel,
         egress: *EgressChannel,
         needle_len: usize,
+        allocator: std.mem.Allocator,
     ) !Self {
         return Self{
             ._ingress = ingress,
             ._egress = egress,
             ._needle_len = needle_len,
+            ._allocator = allocator,
         };
     }
 
@@ -165,8 +174,8 @@ const MemoryLoaderWorker = struct {
     }
 
     fn _processJob(self: *Self, job: IngressChannel.Type) void {
-        // We need to make sure after all is set and done that we free the memory.
-        defer self._ingress.alloc.free(job.file_path);
+        // Note that we do not need to free the file_path here as it will be freed by
+        // the last task in the chain.
 
         // This thread is responsible for loading the file into memory.
         std.log.debug("MemoryLoaderWorker._processJob({s})", .{job.file_path});
@@ -223,7 +232,10 @@ const MemoryLoaderWorker = struct {
         };
 
         std.log.debug("MemoryLoaderWorker.produce {}", .{file_map.len});
-        self._egress.stack.push(MemorySearchChannel.Type{ .mmap_memory = file_map });
+        self._egress.stack.push(MemorySearchChannel.Type{
+            .mmap_memory = file_map,
+            .file_path = file_path,
+        });
     }
 };
 
@@ -232,9 +244,22 @@ const FileSearcherWorker = struct {
     const IngressChannel = MemorySearchChannel;
 
     _ingress: *IngressChannel,
+    _needle: intr.NeedleParameters,
+    _file_path_alloc: std.mem.Allocator,
+    _file_data_alloc: std.mem.Allocator,
 
-    pub fn init(ingress: *IngressChannel) !Self {
-        return Self{ ._ingress = ingress };
+    pub fn init(
+        ingress: *IngressChannel,
+        needle: []const u8,
+        file_path_alloc: std.mem.Allocator,
+        file_data_alloc: std.mem.Allocator,
+    ) !Self {
+        return Self{
+            ._ingress = ingress,
+            ._needle = intr.compileNeedle(needle.ptr, needle.len),
+            ._file_path_alloc = file_path_alloc,
+            ._file_data_alloc = file_data_alloc,
+        };
     }
 
     pub fn run(self: *Self) void {
@@ -260,9 +285,14 @@ const FileSearcherWorker = struct {
     }
 
     fn _processJob(self: *Self, job: IngressChannel.Type) void {
+        defer self._file_path_alloc.free(job.file_path);
+
         std.log.debug("FileSearcherWorker.consume {}", .{job.mmap_memory.len});
+        const found = intr.avx512SearchNeedle(job.mmap_memory.ptr, job.mmap_memory.len, &self._needle);
+        if (found) {
+            std.log.info("Found needle in file {s}.", .{job.file_path});
+        }
         std.posix.munmap(job.mmap_memory);
-        _ = self;
     }
 };
 
@@ -334,7 +364,6 @@ pub fn main() !void {
     var file_path_channel = FilePathChannel{
         .stack = FilePathChannel.StackT.init("file_path_channel"),
         ._done_flag = std.atomic.Value(bool).init(false),
-        .alloc = file_path_alloc.allocator(),
     };
 
     // 512MB of memory for the memory search channel.
@@ -346,16 +375,21 @@ pub fn main() !void {
     var memory_search_channel = MemorySearchChannel{
         .stack = MemorySearchChannel.StackT.init("memory_search_channel"),
         ._done_flag = std.atomic.Value(bool).init(false),
-        .alloc = file_data_alloc.allocator(),
     };
 
-    var fs_traverser_worker = try FsTraverseWorker.init(&file_path_channel, search_dir);
+    var fs_traverser_worker = try FsTraverseWorker.init(&file_path_channel, search_dir, file_path_alloc.allocator());
     var memory_loader_worker = try MemoryLoaderWorker.init(
         &file_path_channel,
         &memory_search_channel,
         needle.len,
+        file_data_alloc.allocator(),
     );
-    var file_searcher_worker = try FileSearcherWorker.init(&memory_search_channel);
+    var file_searcher_worker = try FileSearcherWorker.init(
+        &memory_search_channel,
+        needle,
+        file_path_alloc.allocator(),
+        file_data_alloc.allocator(),
+    );
 
     // Spawn the threads.
     const memory_thread = try std.Thread.spawn(.{}, MemoryLoaderWorker.run, .{&memory_loader_worker});
