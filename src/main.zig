@@ -8,7 +8,7 @@ const sysops = @cImport({
 const intr = @cImport({
     @cInclude("intr.h");
 });
-const stack = @import("stack.zig");
+const heap = @import("heap.zig");
 
 extern threadlocal var errno: c_int;
 
@@ -17,15 +17,15 @@ pub fn SpscChannel(T: type) type {
         const Self = @This();
 
         const Type = T;
-        // We choose to use a stack here because, although a queue would be "more
+        // We choose to use a heap here because, although a queue would be "more
         // correct", in our particular application we do not care about the order
-        // elements are processed as long as they are processed. The stack is slightly
+        // elements are processed as long as they are processed. The heap is slightly
         // faster as the ideal, lock-free implementation only requires one atomic while
         // the Queue requires two atomics. The former allows for slightly less
         // contention.
-        const StackT = stack.SPSCChan(Type, 256, 4);
+        const StackT = heap.SPSCChan(Type, 256, 4);
 
-        stack: StackT,
+        heap: StackT,
 
         _done_flag: std.atomic.Value(bool),
 
@@ -34,7 +34,7 @@ pub fn SpscChannel(T: type) type {
         }
 
         pub fn close(self: *Self) void {
-            self.stack.close();
+            self.heap.close();
             self._done_flag.store(true, .release);
         }
 
@@ -105,7 +105,7 @@ const FsTraverseWorker = struct {
                         inode.path,
                     })) |file_path| {
                         const x = FilePathChannel.Type{ .file_path = file_path };
-                        self._egress.stack.push(x);
+                        self._egress.heap.push(x);
                         std.log.debug("FsTraverseWorker.produce {s}", .{x.file_path});
                     } else |err| {
                         std.log.err("Failed to join path: {}", .{err});
@@ -152,13 +152,13 @@ const MemoryLoaderWorker = struct {
         // While the producer is not done, keep loading files into memory.
         while (!self._ingress.isClosed()) {
             // We read in batches, so let's read the batch and process it.
-            self._processJob(self._ingress.stack.pop());
+            self._processJob(self._ingress.heap.pop());
         }
 
-        // There might still be some stragglers in the stack, so let's process them.
+        // There might still be some stragglers in the heap, so let's process them.
         self._ingress.consumerPostClose();
         while (true) {
-            const maybe_job = self._ingress.stack.tryThreadUnsafePop();
+            const maybe_job = self._ingress.heap.tryThreadUnsafePop();
             if (maybe_job) |job| {
                 self._processJob(job);
             } else {
@@ -169,7 +169,7 @@ const MemoryLoaderWorker = struct {
         // Close out the queue.
         self._egress.close();
         // We also need to ensure we unblock any threads that may be waiting on the
-        // stack.
+        // heap.
         std.log.debug("MemoryLoaderWorker done.", .{});
     }
 
@@ -209,6 +209,7 @@ const MemoryLoaderWorker = struct {
         _ = std.os.linux.fadvise(file_fd, 0, file_stat.size, std.os.linux.POSIX_FADV.NOREUSE);
 
         // Allocate a buffer to read the file into memory.
+        // TODO(mvejnovic): Experiment with MAP_POPULATE on the behest of alkang.
         const file_map = std.posix.mmap(
             null,
             size_to_load,
@@ -232,7 +233,7 @@ const MemoryLoaderWorker = struct {
         };
 
         std.log.debug("MemoryLoaderWorker.produce {}", .{file_map.len});
-        self._egress.stack.push(MemorySearchChannel.Type{
+        self._egress.heap.push(MemorySearchChannel.Type{
             .mmap_memory = file_map,
             .file_path = file_path,
         });
@@ -247,18 +248,21 @@ const FileSearcherWorker = struct {
     _needle: intr.NeedleParameters,
     _file_path_alloc: std.mem.Allocator,
     _file_data_alloc: std.mem.Allocator,
+    _out_file: std.fs.File,
 
     pub fn init(
         ingress: *IngressChannel,
         needle: []const u8,
         file_path_alloc: std.mem.Allocator,
         file_data_alloc: std.mem.Allocator,
+        out_file: std.fs.File,
     ) !Self {
         return Self{
             ._ingress = ingress,
             ._needle = intr.compileNeedle(needle.ptr, needle.len),
             ._file_path_alloc = file_path_alloc,
             ._file_data_alloc = file_data_alloc,
+            ._out_file = out_file,
         };
     }
 
@@ -268,12 +272,12 @@ const FileSearcherWorker = struct {
 
         // While the producer is not done, keep loading files into memory.
         while (!self._ingress.isClosed()) {
-            self._processJob(self._ingress.stack.pop());
+            self._processJob(self._ingress.heap.pop());
         }
 
         self._ingress.consumerPostClose();
         while (true) {
-            const maybe_job = self._ingress.stack.tryThreadUnsafePop();
+            const maybe_job = self._ingress.heap.tryThreadUnsafePop();
             if (maybe_job) |job| {
                 self._processJob(job);
             } else {
@@ -288,9 +292,15 @@ const FileSearcherWorker = struct {
         defer self._file_path_alloc.free(job.file_path);
 
         std.log.debug("FileSearcherWorker.consume {}", .{job.mmap_memory.len});
-        const found = intr.avx512SearchNeedle(job.mmap_memory.ptr, job.mmap_memory.len, &self._needle);
+        const found = intr.avx512SearchNeedle(
+            job.mmap_memory.ptr,
+            job.mmap_memory.len,
+            &self._needle,
+        );
         if (found) {
-            std.log.info("Found needle in file {s}.", .{job.file_path});
+            self._out_file.writer().print("{s}\n", .{job.file_path}) catch |err| {
+                std.log.err("Failed to write to file: {}", .{err});
+            };
         }
         std.posix.munmap(job.mmap_memory);
     }
@@ -360,9 +370,9 @@ pub fn main() !void {
     const file_path_pen = try gpa.allocator().alloc(u8, 1024 * 1024 * 256);
     var file_path_alloc = std.heap.FixedBufferAllocator.init(file_path_pen);
 
-    // Spin up the stacks and the workers.
+    // Spin up the heaps and the workers.
     var file_path_channel = FilePathChannel{
-        .stack = FilePathChannel.StackT.init("file_path_channel"),
+        .heap = FilePathChannel.StackT.init("file_path_channel"),
         ._done_flag = std.atomic.Value(bool).init(false),
     };
 
@@ -373,7 +383,7 @@ pub fn main() !void {
     var file_data_alloc = std.heap.FixedBufferAllocator.init(file_data_pen);
 
     var memory_search_channel = MemorySearchChannel{
-        .stack = MemorySearchChannel.StackT.init("memory_search_channel"),
+        .heap = MemorySearchChannel.StackT.init("memory_search_channel"),
         ._done_flag = std.atomic.Value(bool).init(false),
     };
 
@@ -389,6 +399,7 @@ pub fn main() !void {
         needle,
         file_path_alloc.allocator(),
         file_data_alloc.allocator(),
+        std.io.getStdOut(),
     );
 
     // Spawn the threads.

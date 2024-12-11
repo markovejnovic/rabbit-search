@@ -1,35 +1,5 @@
 const std = @import("std");
 
-pub const QueueMeter = struct {
-    const Self = @This();
-
-    _name: []const u8,
-    starvation_counter: std.atomic.Value(u64),
-    saturation_counter: std.atomic.Value(u64),
-
-    pub fn init(name: []const u8) Self {
-        return Self{
-            ._name = name,
-            .starvation_counter = std.atomic.Value(u64).init(0),
-            .saturation_counter = std.atomic.Value(u64).init(0),
-        };
-    }
-
-    pub fn recordStarvation(self: *Self) void {
-        const starvation = self.starvation_counter.fetchAdd(1, .monotonic);
-        if (starvation % 10 == 0) {
-            std.log.err("{s} starved", .{self._name});
-        }
-    }
-
-    pub fn recordSaturation(self: *Self) void {
-        const saturated = self.saturation_counter.fetchAdd(1, .monotonic);
-        if (saturated % 10 == 0) {
-            std.log.err("{s} saturated", .{self._name});
-        }
-    }
-};
-
 fn Stack(comptime T: type, Capacity: comptime_int) type {
     return struct {
         const Self = @This();
