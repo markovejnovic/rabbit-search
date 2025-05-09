@@ -2,157 +2,309 @@ const std = @import("std");
 const yazap = @import("yazap");
 const sys = @import("sys.zig");
 const builtin = @import("builtin");
-const sync = @import("sync/sync.zig");
-const str = @import("str.zig");
 const sysops = @cImport({
     @cInclude("sysops.h");
 });
+const intr = @cImport({
+    @cInclude("intr.h");
+});
+const heap = @import("heap.zig");
 
-const SearchContext = struct {
-    search_needle: []const u8,
-    out_file: std.fs.File,
-};
+extern threadlocal var errno: c_int;
 
-const StringSearchJob = struct {
+pub fn SpscChannel(T: type) type {
+    return struct {
+        const Self = @This();
+
+        const Type = T;
+        // We choose to use a heap here because, although a queue would be "more
+        // correct", in our particular application we do not care about the order
+        // elements are processed as long as they are processed. The heap is slightly
+        // faster as the ideal, lock-free implementation only requires one atomic while
+        // the Queue requires two atomics. The former allows for slightly less
+        // contention.
+        const StackT = heap.SPSCChan(Type, 256, 4);
+
+        heap: StackT,
+
+        _done_flag: std.atomic.Value(bool),
+
+        pub fn isClosed(self: *const Self) bool {
+            return self._done_flag.load(.monotonic);
+        }
+
+        pub fn close(self: *Self) void {
+            self.heap.close();
+            self._done_flag.store(true, .release);
+        }
+
+        // TODO(mvejnovic): This whole function is a disgusting hack and I'm ashamed of
+        // myself. The only reason it exists is so that we can observe the settling in
+        // close() .release storage. It would be good if I could wrap this in some sort
+        // of context or something, I don't know...
+        pub fn consumerPostClose(self: *Self) void {
+            _ = self._done_flag.load(.acquire);
+        }
+    };
+}
+
+const FilePathChannel = SpscChannel(struct { file_path: [:0]const u8 });
+const MemorySearchChannel = SpscChannel(struct {
+    mmap_memory: []align(std.mem.page_size) u8,
+    file_path: [:0]const u8,
+});
+
+const FsTraverseWorker = struct {
     const Self = @This();
+    const EgressT = FilePathChannel;
 
-    search_context: *const SearchContext,
+    _egress: *EgressT,
+    _start_path: []const u8,
+    _fs_walker: ?std.fs.Dir.Walker,
+    _alloc: std.mem.Allocator,
 
-    file_path: []u8,
-
-    // TODO(markovejnovic): The worker thread does not need to own this memory, as long
-    // as its lifetime is guaranteed to be longer than the worker threads. However, to
-    // make life easy on myself and make a correct program, I've decided to add
-    // ownership here.
-    // Remember, this could simply borrow the already allocated memory coming from the
-    // main thread.
-    //
-    // The main reason this is here is because I do not understand the allocation rules
-    // of walker. If I understood that better, we wouldn't need to manually do this.
-    alloc: std.mem.Allocator,
-
-    /// Create a new job.
-    /// Note that you do not need to manage file_path. It will be deallocated for you.
-    /// TODO(markovejnovic): Avoid deallocating it eagerly.
     pub fn init(
-        // TODO(markovejnovic): I don't know how I feel passing so much crap down into
-        // this constructor. Perhaps these should be done by the caller?
-        search_context: *const SearchContext,
-        search_start: *const std.fs.Dir,
-        walker_entry: *const std.fs.Dir.Walker.Entry,
+        egress: *EgressT,
+        start_path: []const u8,
         alloc: std.mem.Allocator,
-    ) ?Self {
-        switch (walker_entry.kind) {
-            .file => {
-                const abs_path = search_start.realpathAlloc(
-                    alloc,
-                    walker_entry.path,
-                ) catch |err| {
-                    std.log.err(
-                        "Could not determine the full path for {}/{s} due to {}.",
-                        .{ search_start, walker_entry.path, err },
-                    );
-                    return null;
-                };
-                return Self{
-                    .search_context = search_context,
-                    .alloc = alloc,
-                    .file_path = abs_path,
-                };
-            },
-            else => {
-                // TODO(markovejnovic): Do other file types. Could skip based on
-                // .gitignore heuristics.
-                return null;
-            },
+    ) !Self {
+        return Self{
+            ._egress = egress,
+            ._start_path = start_path,
+            ._fs_walker = null,
+            ._alloc = alloc,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self._fs_walker) |*walker| {
+            walker.deinit();
         }
     }
 
-    pub fn deinit(self: *const Self) void {
-        self.alloc.free(self.file_path);
-    }
+    pub fn run(self: *Self) !void {
+        // TODO(mvejnovic): This is a hack.
+        _ = sysops.pinThreadToCore(@intCast(0));
 
-    pub fn format(
-        self: Self,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
+        const root_path = try std.fs.cwd().realpathAlloc(
+            self._alloc,
+            self._start_path,
+        );
+        defer self._alloc.free(root_path);
 
-        try writer.print("StringSearchJob({s})", .{self.file_path});
+        var root = try std.fs.openDirAbsolute(root_path, .{ .iterate = true });
+        defer root.close();
+
+        self._fs_walker = try root.walk(self._alloc);
+
+        while (try self._fs_walker.?.next()) |inode| {
+            switch (inode.kind) {
+                .file => {
+                    if (std.fs.path.joinZ(self._alloc, &[_][]const u8{
+                        root_path,
+                        inode.path,
+                    })) |file_path| {
+                        const x = FilePathChannel.Type{ .file_path = file_path };
+                        self._egress.heap.push(x);
+                        std.log.debug("FsTraverseWorker.produce {s}", .{x.file_path});
+                    } else |err| {
+                        std.log.err("Failed to join path: {}", .{err});
+                        continue;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        self._egress.close();
+        std.log.debug("FsTraverseWorker done.", .{});
     }
 };
 
-fn file_search(job: StringSearchJob) void {
-    // We will need to deallocate the job in the searcher thread.
-    defer job.deinit();
-    std.log.debug("Searching for {}", .{job});
+const MemoryLoaderWorker = struct {
+    const Self = @This();
+    const IngressChannel = FilePathChannel;
+    const EgressChannel = MemorySearchChannel;
 
-    // TODO(markovejnovic): There is a significant number of heuristics we could apply
-    // to our search attempt that could be applied. Some Ideas:
-    //   - Do not search if the file appears to be a binary file.
-    //   - Do not search if the file is in a .gitignore
+    _ingress: *IngressChannel,
+    _egress: *EgressChannel,
+    _needle_len: usize,
+    _allocator: std.mem.Allocator,
 
-    // Let us query some information about the file.
-    const file = std.fs.openFileAbsolute(job.file_path, .{}) catch |err| {
-        std.log.err("Could not open {} due to {}", .{ job, err });
-        return;
-    };
-    const file_stats = file.stat() catch |err| {
-        std.log.err("Could not stat() {} due to {}", .{ job, err });
-        return;
-    };
-
-    const file_sz = file_stats.size;
-
-    // Easy-case, exit early, we know we won't find shit here.
-    if (file_sz == 0) {
-        return;
+    pub fn init(
+        ingress: *IngressChannel,
+        egress: *EgressChannel,
+        needle_len: usize,
+        allocator: std.mem.Allocator,
+    ) !Self {
+        return Self{
+            ._ingress = ingress,
+            ._egress = egress,
+            ._needle_len = needle_len,
+            ._allocator = allocator,
+        };
     }
 
-    // TODO(markovejnovic): Query the system from /proc/meminfo | grep Hugepagesize
-    const HUGE_PG_SZ = 2048 * 1024;
-    //const use_tlb = file_sz >= HUGE_PG_SZ;
-    const use_tlb = false; // TODO(markovejnovic): Figure out why on earth mmap returns
-    // einval for use_tlb = True, even though everything looks
-    // well populated. Maybe bug in sys.boundary_align
-    const alloc_sz = if (use_tlb) sys.boundary_align(file_sz, HUGE_PG_SZ) else file_sz;
+    pub fn run(self: *Self) void {
+        // TODO(mvejnovic): This is a hack.
+        _ = sysops.pinThreadToCore(@intCast(2));
 
-    std.log.debug("mmap()ing {s}", .{job.file_path});
-    const data = std.posix.mmap(
-        null,
-        alloc_sz,
-        std.posix.PROT.READ,
-        .{
-            // TODO(markovejnovic): Pull this information from
-            // /proc/meminfo | grep Hugepagesize
-            .HUGETLB = use_tlb,
-            .POPULATE = true,
-            .TYPE = .PRIVATE,
-        },
-        file.handle,
-        0,
-    ) catch |err| {
-        std.log.err("Could not mmap() {} due to {}", .{ job, err });
-        return;
-    };
-    defer std.posix.munmap(data);
+        // While the producer is not done, keep loading files into memory.
+        while (!self._ingress.isClosed()) {
+            // We read in batches, so let's read the batch and process it.
+            self._processJob(self._ingress.heap.pop());
+        }
 
-    std.posix.madvise(
-        data.ptr,
-        file_sz,
-        std.posix.MADV.SEQUENTIAL | std.posix.MADV.WILLNEED,
-    ) catch |err| {
-        std.log.warn("Could not madvise() {} due to {}.", .{ job, err });
-    };
+        // There might still be some stragglers in the heap, so let's process them.
+        self._ingress.consumerPostClose();
+        while (true) {
+            const maybe_job = self._ingress.heap.tryThreadUnsafePop();
+            if (maybe_job) |job| {
+                self._processJob(job);
+            } else {
+                break;
+            }
+        }
 
-    std.log.debug("strsearching {s}", .{job.file_path});
-    if (str.strsearch(job.search_context.search_needle, data)) {
-        job.search_context.out_file.writer().print("{s}\n", .{job.file_path}) catch {};
+        // Close out the queue.
+        self._egress.close();
+        // We also need to ensure we unblock any threads that may be waiting on the
+        // heap.
+        std.log.debug("MemoryLoaderWorker done.", .{});
     }
-}
+
+    fn _processJob(self: *Self, job: IngressChannel.Type) void {
+        // Note that we do not need to free the file_path here as it will be freed by
+        // the last task in the chain.
+
+        // This thread is responsible for loading the file into memory.
+        std.log.debug("MemoryLoaderWorker._processJob({s})", .{job.file_path});
+        const file_path = job.file_path;
+
+        // Open the file in direct mode.
+        // TODO(mvejnovic): Figure out if .DIRECT = true is good
+        const file_fd = std.c.open(file_path, .{ .ACCMODE = .RDONLY });
+        if (file_fd == -1) {
+            // TODO(mvejnovic): Write the errno.
+            std.log.err("Failed to open file: {s}", .{file_path});
+            return;
+        }
+        defer _ = std.c.close(file_fd);
+
+        // fstat the file so we know how much to read.
+        var file_stat: std.c.Stat = undefined;
+        if (std.c.fstat(file_fd, &file_stat) == -1) {
+            // TODO(mvejnovic): Write the errno.
+            std.log.err("Failed to fstat file: {s}", .{file_path});
+            return;
+        }
+
+        if (file_stat.size < self._needle_len) {
+            // If the file is smaller than the needle, there is no point in attempting
+            // to read it.
+            return;
+        }
+
+        const size_to_load: usize = @intCast(file_stat.size);
+        _ = std.os.linux.fadvise(file_fd, 0, file_stat.size, std.os.linux.POSIX_FADV.NOREUSE);
+
+        // Allocate a buffer to read the file into memory.
+        // TODO(mvejnovic): Experiment with MAP_POPULATE on the behest of alkang.
+        const file_map = std.posix.mmap(
+            null,
+            size_to_load,
+            std.os.linux.PROT.READ,
+            .{
+                .TYPE = .PRIVATE,
+            },
+            file_fd,
+            0,
+        ) catch |err| {
+            std.log.err("Failed to mmap file: {s}: {}", .{ file_path, err });
+            return;
+        };
+
+        std.posix.madvise(
+            file_map.ptr,
+            size_to_load,
+            std.posix.MADV.SEQUENTIAL | std.posix.MADV.WILLNEED | std.posix.MADV.DONTFORK,
+        ) catch |err| {
+            std.log.err("Failed to madvise file: {s}: {}", .{ file_path, err });
+        };
+
+        std.log.debug("MemoryLoaderWorker.produce {}", .{file_map.len});
+        self._egress.heap.push(MemorySearchChannel.Type{
+            .mmap_memory = file_map,
+            .file_path = file_path,
+        });
+    }
+};
+
+const FileSearcherWorker = struct {
+    const Self = @This();
+    const IngressChannel = MemorySearchChannel;
+
+    _ingress: *IngressChannel,
+    _needle: intr.NeedleParameters,
+    _file_path_alloc: std.mem.Allocator,
+    _file_data_alloc: std.mem.Allocator,
+    _out_file: std.fs.File,
+
+    pub fn init(
+        ingress: *IngressChannel,
+        needle: []const u8,
+        file_path_alloc: std.mem.Allocator,
+        file_data_alloc: std.mem.Allocator,
+        out_file: std.fs.File,
+    ) !Self {
+        return Self{
+            ._ingress = ingress,
+            ._needle = intr.compileNeedle(needle.ptr, needle.len),
+            ._file_path_alloc = file_path_alloc,
+            ._file_data_alloc = file_data_alloc,
+            ._out_file = out_file,
+        };
+    }
+
+    pub fn run(self: *Self) void {
+        // TODO(mvejnovic): This is a hack.
+        _ = sysops.pinThreadToCore(@intCast(4));
+
+        // While the producer is not done, keep loading files into memory.
+        while (!self._ingress.isClosed()) {
+            self._processJob(self._ingress.heap.pop());
+        }
+
+        self._ingress.consumerPostClose();
+        while (true) {
+            const maybe_job = self._ingress.heap.tryThreadUnsafePop();
+            if (maybe_job) |job| {
+                self._processJob(job);
+            } else {
+                break;
+            }
+        }
+
+        std.log.debug("FileSearcherWorker done.", .{});
+    }
+
+    fn _processJob(self: *Self, job: IngressChannel.Type) void {
+        defer self._file_path_alloc.free(job.file_path);
+
+        std.log.debug("FileSearcherWorker.consume {}", .{job.mmap_memory.len});
+        const found = intr.avx512SearchNeedle(
+            job.mmap_memory.ptr,
+            job.mmap_memory.len,
+            &self._needle,
+        );
+        if (found) {
+            self._out_file.writer().print("{s}\n", .{job.file_path}) catch |err| {
+                std.log.err("Failed to write to file: {}", .{err});
+            };
+        }
+        std.posix.munmap(job.mmap_memory);
+    }
+};
 
 pub fn main() !void {
     // TODO(markovejnovic): This allocator needs to be sped up.
@@ -205,54 +357,61 @@ pub fn main() !void {
         search_dir = ".";
     }
 
-    // Figure out the search path.
-    const to_search = try std.fs.cwd().realpathAlloc(gpa.allocator(), search_dir);
-    std.log.debug("Searching {s}", .{to_search});
-    defer gpa.allocator().free(to_search);
-
-    // Spin up the thread queue.
-    var thread_pool = try sync.SpinningThreadPool(StringSearchJob, &file_search).init(
-        gpa.allocator(),
-        jobs,
-    );
-    try thread_pool.begin();
-    defer thread_pool.deinit();
-
-    // Prepare the searching context.
-    const search_context = SearchContext{
-        .search_needle = args.getSingleValue("NEEDLE").?,
-        .out_file = std.io.getStdOut(),
-    };
-
     // To make filesystem traversal faster and easier, we attempt to setrlimit to be a
     // very large limit.
     const max_lim = (try std.posix.getrlimit(.NOFILE)).max;
     try std.posix.setrlimit(.NOFILE, .{ .cur = max_lim, .max = max_lim });
 
-    // Traverse the filesystem and feed each worker with work.
-    var fs_start = try std.fs.openDirAbsolute(to_search, .{ .iterate = true });
-    defer fs_start.close();
+    // Parse out the needle.
+    const needle = args.getSingleValue("NEEDLE").?;
 
-    // Pin the file-tree traversal onto one core to minimize contention between it and
-    // the consumers.
-    if (sysops.pinThreadToCore(@intCast(0)) != 0) {
-        std.log.err("Failed to pin thread to core.", .{});
-        return;
-    }
-    var fs_walker = try fs_start.walk(gpa.allocator());
-    defer fs_walker.deinit();
-    while (try fs_walker.next()) |file| {
-        if (StringSearchJob.init(
-            &search_context,
-            &fs_start,
-            &file,
-            gpa.allocator(),
-        )) |search_job| {
-            try thread_pool.enqueue(search_job);
-        }
-    }
+    // 256M is fine.
+    // TODO(mvejnovic): This is a hack. Make it configurable.
+    const file_path_pen = try gpa.allocator().alloc(u8, 1024 * 1024 * 256);
+    var file_path_alloc = std.heap.FixedBufferAllocator.init(file_path_pen);
 
-    // This is critical because we need to prevent the memory allocated by fs_walker to
-    // be deallocated prematurely.
-    try thread_pool.blockUntilEmpty();
+    // Spin up the heaps and the workers.
+    var file_path_channel = FilePathChannel{
+        .heap = FilePathChannel.StackT.init("file_path_channel"),
+        ._done_flag = std.atomic.Value(bool).init(false),
+    };
+
+    // 512MB of memory for the memory search channel.
+    // TODO(mvejnovic): This is a hack. Make it configurable.
+    const file_data_pen = try gpa.allocator().alloc(u8, 4 * 1024 * 1024 * 1024);
+    defer gpa.allocator().free(file_data_pen);
+    var file_data_alloc = std.heap.FixedBufferAllocator.init(file_data_pen);
+
+    var memory_search_channel = MemorySearchChannel{
+        .heap = MemorySearchChannel.StackT.init("memory_search_channel"),
+        ._done_flag = std.atomic.Value(bool).init(false),
+    };
+
+    var fs_traverser_worker = try FsTraverseWorker.init(&file_path_channel, search_dir, file_path_alloc.allocator());
+    var memory_loader_worker = try MemoryLoaderWorker.init(
+        &file_path_channel,
+        &memory_search_channel,
+        needle.len,
+        file_data_alloc.allocator(),
+    );
+    var file_searcher_worker = try FileSearcherWorker.init(
+        &memory_search_channel,
+        needle,
+        file_path_alloc.allocator(),
+        file_data_alloc.allocator(),
+        std.io.getStdOut(),
+    );
+
+    // Spawn the threads.
+    const memory_thread = try std.Thread.spawn(.{}, MemoryLoaderWorker.run, .{&memory_loader_worker});
+    const searcher_thread = try std.Thread.spawn(.{}, FileSearcherWorker.run, .{&file_searcher_worker});
+
+    // The current thread will be the filesystem traverser.
+    try fs_traverser_worker.run();
+
+    std.log.debug("Waiting for threads to finish...", .{});
+    searcher_thread.join();
+    memory_thread.join();
+
+    fs_traverser_worker.deinit();
 }

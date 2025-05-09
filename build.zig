@@ -7,20 +7,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const stringzilla = b.addStaticLibrary(.{
-        .name = "StringZilla",
+    const intr = b.addStaticLibrary(.{
+        .name = "Intr",
         .target = target,
         .optimize = optimize,
     });
-    stringzilla.addIncludePath(b.path("third-party/StringZilla/include/"));
-    stringzilla.defineCMacro("SZ_DYNAMIC_DISPATCH", "0");
-    stringzilla.defineCMacro("SZ_USE_X86_AVX512", "1");
-    stringzilla.defineCMacro("SZ_USE_X86_AVX2", "0");
-    stringzilla.defineCMacro("SZ_AVOID_LIBC", "1");
-    stringzilla.addCSourceFile(.{
-        .file = b.path("third-party/StringZilla/c/lib.c"),
-    });
-    stringzilla.linkLibC();
+    intr.addCSourceFile(.{ .file = b.path("c/intr.c") });
+    intr.linkLibC();
 
     const clib = b.addStaticLibrary(.{
         .name = "cex",
@@ -42,7 +35,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("yazap", yazap.module("yazap"));
 
     exe.linkLibC();
-    exe.linkLibrary(stringzilla);
+    exe.linkLibrary(intr);
     exe.addIncludePath(b.path("c"));
     exe.linkLibrary(clib);
 
