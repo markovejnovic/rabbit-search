@@ -220,6 +220,9 @@ constexpr auto Worker<Scheduler>::TryDoJob() noexcept -> bool {
 
 template <class Scheduler>
 constexpr void Worker<Scheduler>::Run() {
+  static constexpr std::uint32_t kSpinnerBackoff = 1;
+  std::uint32_t spin_count = 0;
+
   while (true) {
     if (scheduler_->exit_signal_.load(std::memory_order_relaxed)) {
       // The user requested exit. Abort everything and get out. Don't even flush.
@@ -234,7 +237,15 @@ constexpr void Worker<Scheduler>::Run() {
       break;
     }
 
-    TryDoJob();
+    if (TryDoJob()) {
+      spin_count = 0;
+    } else {
+      spin_count += kSpinnerBackoff;
+      // Spin a tiny bit to back-off from the queues.
+      for (std::size_t i = 0; i < spin_count; ++i) {
+        __asm__ volatile("yield");
+      }
+    }
   }
 }
 
