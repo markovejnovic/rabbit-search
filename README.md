@@ -1,6 +1,6 @@
 # 🐇 Rabbit Search
 
-> ![WARNING]
+> [!WARNING]
 > 🚧 This program is a work-in-progress. It is not ready for production use and may contain bugs.
 
 ![Dumb Drawing by ChatGPT](./res/banner.webp)
