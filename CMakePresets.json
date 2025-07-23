@@ -1,0 +1,39 @@
+{
+  "version": 10,
+  "configurePresets": [
+    {
+      "name": "debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "YES",
+        "RBS_CLANG_TIDY": "/opt/homebrew/Cellar/llvm@19/19.1.7/bin/clang-tidy",
+        "RBS_CLANG_FORMAT": "/opt/homebrew/Cellar/llvm@19/19.1.7/bin/clang-format"
+      },
+      "environment": {
+        "CC": "/opt/homebrew/Cellar/llvm@19/19.1.7/bin/clang",
+        "CXX": "/opt/homebrew/Cellar/llvm@19/19.1.7/bin/clang++",
+        "LD": "lld",
+        "LDFLAGS": "-fuse-ld=lld"
+      }
+    },
+    {
+      "name": "default",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "YES",
+        "RBS_CLANG_TIDY": "/opt/homebrew/Cellar/llvm@19/19.1.7/bin/clang-tidy",
+        "RBS_CLANG_FORMAT": "/opt/homebrew/Cellar/llvm@19/19.1.7/bin/clang-format"
+      },
+      "environment": {
+        "CC": "/opt/homebrew/Cellar/llvm@19/19.1.7/bin/clang",
+        "CXX": "/opt/homebrew/Cellar/llvm@19/19.1.7/bin/clang++",
+        "LD": "lld",
+        "LDFLAGS": "-fuse-ld=lld"
+      }
+    }
+  ]
+}
