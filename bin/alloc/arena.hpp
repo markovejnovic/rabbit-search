@@ -80,7 +80,7 @@ public:
   }
 
 private:
-  std::atomic<Node*> tail_ = nullptr;
+  std::atomic<Node*> tail_ alignas(std::hardware_destructive_interference_size) = nullptr;
 };
 
 } // namespace rbs::alloc

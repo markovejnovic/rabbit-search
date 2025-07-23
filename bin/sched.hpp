@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <sys/_pthread/_pthread_t.h>
 #include <cstdint>
+#include <new>
 #include <ranges>
 #include <thread>
 #include <utility>
@@ -132,6 +133,7 @@ class Scheduler {
   alloc::MPArena<FsNode> fsNodeArena_;
 
   Allocator allocator_;
+
   std::uint16_t threadCount_;
   // TODO(marko): Share allocator with this vector.
   std::vector<pthread_t> workers_;
@@ -145,9 +147,9 @@ class Scheduler {
 
   std::string_view searchString_;
 
-  std::atomic<bool> exit_signal_{false};
+  std::atomic<bool> exit_signal_ alignas(std::hardware_destructive_interference_size) {false};
 
-  std::atomic<std::uint16_t> dirsOpen_{0};
+  std::atomic<std::uint16_t> dirsOpen_ alignas(std::hardware_destructive_interference_size) { 0 };
 };
 
 template <class Scheduler>
