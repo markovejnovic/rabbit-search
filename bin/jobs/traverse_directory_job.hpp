@@ -6,7 +6,6 @@
 #include <filesystem>
 #include <format>
 #include <system_error>
-#include "ijob.hpp"
 #include <dirent.h>
 #include <cassert>
 #include "fs_node.hpp"
@@ -17,7 +16,7 @@
 namespace rbs {
 
 
-class TraverseDirectoryJob final : public IJob<TraverseDirectoryJob> {
+class TraverseDirectoryJob final {
   static constexpr Logger kLogger{"TraverseDirectoryJob"};
 
 public:
@@ -25,7 +24,7 @@ public:
       : dir_(dir), dirHandle_(dirHandle) {}
 
   template <class Worker>
-  constexpr void ServiceImpl(Worker& worker) noexcept {
+  constexpr void Service(Worker& worker) noexcept {
     while (true) {
       // Note this implementation assumes that ServiceImpl is noexcept to close the fd at the end.
       // TODO(marko): Improve the following. Note that there is an off-by-one error here. We create
@@ -66,7 +65,7 @@ public:
           }
           DIR* new_dir_handle = fdopendir(dir_fd);
 
-          worker.GetScheduler()->Submit(TraverseDirectoryJob(dir, new_dir_handle));
+          worker.Submit(TraverseDirectoryJob(dir, new_dir_handle));
           continue;
         }
         case DT_LNK: {
@@ -76,6 +75,7 @@ public:
         }
         case DT_REG: {
           // We found a regular file that we can search in.
+          worker.OpenFile();
           const int file_fd = openat(dirfd(dirHandle_), dir->Entry.d_name, O_RDONLY);
           if (file_fd == -1) [[unlikely]] {
             // Failed to open file, log the error.
@@ -84,7 +84,7 @@ public:
             continue;
           }
 
-          worker.GetScheduler()->Submit(SearchFileJob(dir, file_fd));
+          worker.Submit(SearchFileJob(dir, file_fd));
           continue;
         }
         default: {
@@ -108,6 +108,10 @@ public:
     }
 
     return TraverseDirectoryJob{nullptr, dir_handle};
+  }
+
+  [[nodiscard]] constexpr auto Exists() const noexcept -> bool {
+    return dirHandle_ != nullptr;
   }
 
 private:

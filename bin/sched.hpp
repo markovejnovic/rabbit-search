@@ -12,7 +12,7 @@
 #include "alloc/arena.hpp"
 #include "concurrentqueue.h"
 #include "fs_node.hpp"
-#include "jobs/maybe_job.hpp"
+#include "jobs/search_file_job.hpp"
 #include "jobs/traverse_directory_job.hpp"
 #include "result.hpp"
 #include "worker.hpp"
@@ -73,13 +73,13 @@ class Scheduler {
     workers_.reserve(threadCount_);
 
     for (std::uint16_t i = 0; i < threadCount_; ++i) {
-      auto job_prod = moodycamel::ProducerToken(jobQueue_);
-      auto job_cons = moodycamel::ConsumerToken(jobQueue_);
-      auto result_prod = moodycamel::ProducerToken(resultQueue_);
+      auto* worker = new WorkerType(this, moodycamel::ProducerToken(traverseDirectoryQueue_),
+                                    moodycamel::ConsumerToken(traverseDirectoryQueue_),
+                                    moodycamel::ProducerToken(searchFileQueue_),
+                                    moodycamel::ConsumerToken(searchFileQueue_),
+                                    moodycamel::ProducerToken(resultQueue_), &fsNodeArena_);
 
-      workerObjects_.emplace(workerObjects_.begin() + i,
-                             new WorkerType(this, std::move(job_prod), std::move(job_cons),
-                                            std::move(result_prod), &fsNodeArena_));
+      workerObjects_.emplace(workerObjects_.begin() + i, worker);
       workers_.emplace(workers_.begin() + i, pthread_t{});
       const int error_num = pthread_create(&workers_[i], nullptr, &workerThreadEntry<WorkerType>,
                                            static_cast<void*>(workerObjects_[i]));
@@ -98,20 +98,25 @@ class Scheduler {
     return std::ranges::any_of(working, [](bool is_working) { return is_working; });
   }
 
-  constexpr void Submit(TraverseDirectoryJob&& job) {
+  constexpr void Submit(TraverseDirectoryJob&& job, moodycamel::ProducerToken& token) {
     dirsOpen_.fetch_add(1, std::memory_order_relaxed);
-    const bool enqueue_result = jobQueue_.enqueue(MaybeJob(job));
+    const bool enqueue_result = traverseDirectoryQueue_.enqueue(token, job);
+    assert(enqueue_result && "Failed to enqueue job. This is a bug.");
+  }
+
+  constexpr void SlowSubmit(TraverseDirectoryJob&& job) {
+    dirsOpen_.fetch_add(1, std::memory_order_relaxed);
+    const bool enqueue_result = traverseDirectoryQueue_.enqueue(job);
+    assert(enqueue_result && "Failed to enqueue job. This is a bug.");
+  }
+
+  constexpr void Submit(SearchFileJob&& job, moodycamel::ProducerToken& token) {
+    const bool enqueue_result = searchFileQueue_.enqueue(token, job);
     assert(enqueue_result && "Failed to enqueue job. This is a bug.");
   }
 
   [[nodiscard]] constexpr auto DirectoriesCurrentlyOpen() -> std::uint16_t {
     return dirsOpen_.load(std::memory_order_relaxed);
-  }
-
-  constexpr void Submit(MaybeJob&& job) {
-    assert(job.HasValue());
-    const bool enqueue_result = jobQueue_.enqueue(job);
-    assert(enqueue_result && "Failed to enqueue job. This is a bug.");
   }
 
   [[nodiscard]] constexpr auto ResultToken() noexcept -> moodycamel::ConsumerToken {
@@ -140,48 +145,110 @@ class Scheduler {
 
   std::vector<WorkerType*> workerObjects_;
 
-  // Note that MaybeJob::None will never be emplaced in this queue.
-  moodycamel::ConcurrentQueue<MaybeJob> jobQueue_;
+  moodycamel::ConcurrentQueue<TraverseDirectoryJob> traverseDirectoryQueue_;
+  moodycamel::ConcurrentQueue<SearchFileJob> searchFileQueue_;
 
   moodycamel::ConcurrentQueue<Result> resultQueue_;
 
   std::string_view searchString_;
 
-  std::atomic<bool> exit_signal_ alignas(std::hardware_destructive_interference_size) {false};
+  std::atomic<bool> exit_signal_ alignas(std::hardware_destructive_interference_size){false};
 
-  std::atomic<std::uint16_t> dirsOpen_ alignas(std::hardware_destructive_interference_size) { 0 };
+  std::atomic<std::uint16_t> dirsOpen_ alignas(std::hardware_destructive_interference_size){0};
+
+  std::atomic<std::uint16_t> fdsOpen_ alignas(std::hardware_destructive_interference_size){0};
 };
+
+template <class Scheduler>
+constexpr auto Worker<Scheduler>::TryFileReadingJob() noexcept -> bool {
+  SearchFileJob job = GetSearchFileJob();
+  if (!job.Exists()) {
+    return false;
+  }
+
+  job.Service(*this);
+  return true;
+}
+
+template <class Scheduler>
+constexpr auto Worker<Scheduler>::TryDirectoryTraversalJob() noexcept -> bool {
+  TraverseDirectoryJob job = GetTraverseDirectoryJob();
+  if (!job.Exists()) {
+    return false;
+  }
+
+  job.Service(*this);
+  return true;
+}
+
+template <class Scheduler>
+constexpr auto Worker<Scheduler>::TryDoJob() noexcept -> bool {
+  const std::uint16_t files_open = FilesOpen();
+  if (files_open > kFilesOpenTarget) {
+    // We have too many file descriptors open, let's service searching through files, rather than
+    // open more files.
+    if (!TryFileReadingJob()) {
+      // There doesn't appear to be a job we can do right now.
+      if (files_open < kMaxFilesOpen) {
+        // However, we're not at the maximum number of files open, so we can still try to open a
+        // couple.
+        //
+        // It's worse to be sitting idle.
+        return TryDirectoryTraversalJob();
+      }
+
+      // We simply have too many files open, and the best we can do is pray some of them will
+      // magically close.
+      kLogger.Error(
+          "We have too many files open, and we can't do anything about it right now. "
+          "This is a bug in the scheduler.");
+      return false;
+    }
+
+    // We managed to read the file just fine.
+    return true;
+  }
+
+  // In the other case, we should go ahead and open some files.
+  if (!TryDirectoryTraversalJob()) {
+    // There were no jobs to traverse directories, let's avoid sitting idle.
+    return TryFileReadingJob();
+  }
+
+  return false;
+}
 
 template <class Scheduler>
 constexpr void Worker<Scheduler>::Run() {
   while (true) {
     if (scheduler_->exit_signal_.load(std::memory_order_relaxed)) {
+      // The user requested exit. Abort everything and get out. Don't even flush.
       break;
     }
 
     const std::uint16_t directories_currently_open = scheduler_->DirectoriesCurrentlyOpen();
+
     if (directories_currently_open == 0) {
       // If no directories are currently open, we need to flush the queue of jobs and exit.
-      MaybeJob job = MaybeJob::None();
-      while ((job = GetJob()).HasValue()) {
-        job.Service(*this);
-      }
-
-      // After flushing out the queue, we can exit this thread.
+      while (TryFileReadingJob()) {}
       break;
     }
 
-    MaybeJob job = GetJob();
-    if (job.HasValue()) {
-      job.Service(*this);
-    }
+    TryDoJob();
   }
 }
 
 template <class Scheduler>
-constexpr auto Worker<Scheduler>::GetJob() noexcept -> MaybeJob {
-  MaybeJob job = MaybeJob::None();
-  scheduler_->jobQueue_.try_dequeue(consumerToken_, job);
+constexpr auto Worker<Scheduler>::GetTraverseDirectoryJob() noexcept -> TraverseDirectoryJob {
+  TraverseDirectoryJob job{nullptr, nullptr};
+  scheduler_->traverseDirectoryQueue_.try_dequeue(directoryConsumerToken_, job);
+  return job;
+}
+
+template <class Scheduler>
+constexpr auto Worker<Scheduler>::GetSearchFileJob() noexcept -> SearchFileJob {
+  SearchFileJob job{nullptr, 0};
+  scheduler_->searchFileQueue_.try_dequeue(fileSearchConsumerToken_, job);
   return job;
 }
 

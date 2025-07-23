@@ -18,13 +18,16 @@ cmake --preset benchmark -DRBS_USE_MIMALLOC=OFF \
 
 hyperfine \
   --warmup 8 \
-  --runs 16 \
+  --runs 32 \
   "$RBS_MIMALLOC_PATH $DIR $NEEDLE -j 1" \
   "$RBS_MIMALLOC_PATH $DIR $NEEDLE -j 2" \
   "$RBS_MIMALLOC_PATH $DIR $NEEDLE -j 4" \
+  "$RBS_MIMALLOC_PATH $DIR $NEEDLE -j 8" \
   "$RBS_GLIBCMALLOC_PATH $DIR $NEEDLE -j 1" \
   "$RBS_GLIBCMALLOC_PATH $DIR $NEEDLE -j 2" \
   "$RBS_GLIBCMALLOC_PATH $DIR $NEEDLE -j 4" \
+  "$RBS_GLIBCMALLOC_PATH $DIR $NEEDLE -j 8" \
   "rg -j 1 --no-ignore --hidden --binary --fixed-strings --no-heading --no-line-number $NEEDLE $DIR" \
   "rg -j 2 --no-ignore --hidden --binary --fixed-strings --no-heading --no-line-number $NEEDLE $DIR" \
   "rg -j 4 --no-ignore --hidden --binary --fixed-strings --no-heading --no-line-number $NEEDLE $DIR" \
+  "rg -j 8 --no-ignore --hidden --binary --fixed-strings --no-heading --no-line-number $NEEDLE $DIR" \

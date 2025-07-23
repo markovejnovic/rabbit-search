@@ -4,7 +4,6 @@
 #include <span>
 #include "cli.hpp"
 #include "concurrentqueue.h"
-#include "jobs/maybe_job.hpp"
 #include "jobs/traverse_directory_job.hpp"
 #include "sched.hpp"
 
@@ -30,7 +29,7 @@ auto Main(std::span<char*> args) -> int {
   CliArgs cli_args{args};
 
   Scheduler scheduler{cli_args.Jobs(), cli_args.SearchString()};
-  scheduler.Submit(TraverseDirectoryJob::FromPath(cli_args.SearchPath()));
+  scheduler.SlowSubmit(TraverseDirectoryJob::FromPath(cli_args.SearchPath()));
   scheduler.Run();
 
   moodycamel::ConsumerToken consumer_token = scheduler.ResultToken();

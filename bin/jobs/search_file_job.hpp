@@ -1,11 +1,9 @@
 #ifndef RBS_SEARCH_FILE_JOB_HPP
 #define RBS_SEARCH_FILE_JOB_HPP
 
-#include "ijob.hpp"
 #include "fs_node.hpp"
 #include "log.hpp"
 #include "result.hpp"
-#include "util.hpp"
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -13,9 +11,25 @@
 
 namespace rbs {
 
-class SearchFileJob final : public IJob<SearchFileJob> {
+class SearchFileJob final {
 private:
   static constexpr Logger kLogger{"SearchFileJob"};
+
+  template <class Worker>
+  class FdCloser {
+  public:
+    explicit FdCloser(int fileDesc, Worker& worker) noexcept : fd_(fileDesc), worker_(&worker) {}
+
+    ~FdCloser() noexcept {
+      close(fd_);
+      worker_->FinishVisitingFile();
+    }
+
+  private:
+    int fd_;
+    Worker* worker_;
+  };
+
 public:
   explicit constexpr SearchFileJob(
     FsNode* fsNode,
@@ -23,8 +37,8 @@ public:
   ) noexcept : fsNode_(fsNode), fd_(fileDescriptor) {}
 
   template <class Worker>
-  constexpr void ServiceImpl(Worker& worker) noexcept {
-    rbs::Defer cleanup { [this] { close(fd_); }};
+  constexpr void Service(Worker& worker) noexcept {
+    FdCloser closer{fd_, worker};
 
     struct stat file_stat;
     if (fstat(fd_, &file_stat) == -1) {
@@ -43,7 +57,6 @@ public:
       return;
     }
 
-    rbs::Defer unmap { [data, file_stat] { munmap(data, file_stat.st_size); }};
     namespace sz = ashvardanian::stringzilla;
 
     const sz::string_view haystack(static_cast<const char*>(data), file_stat.st_size);
@@ -54,12 +67,18 @@ public:
     if (found) {
       worker.PushResult(Result{fsNode_});
     }
+
+    munmap(data, file_stat.st_size);
   }
 
   template <class Worker>
   [[nodiscard]] constexpr auto Needle(const Worker& worker) -> std::string_view {
     // TODO(marko): yucky hack
     return worker.SearchString();
+  }
+
+  [[nodiscard]] constexpr auto Exists() const noexcept -> bool {
+    return fsNode_ != nullptr;
   }
 
 private:
