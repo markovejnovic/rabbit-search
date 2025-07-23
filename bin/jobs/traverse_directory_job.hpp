@@ -40,18 +40,10 @@ public:
 
       dirent* entry = nullptr;
       if (readdir_r(dirHandle_, &dir->Entry, &entry) != 0) {
-        kLogger.Error(std::format("Failed to read directory entry: {}",
-                                 std::strerror(errno)));
         break;
       }
 
       if (entry == nullptr) [[unlikely]] {
-        if (dir_ != nullptr) {
-          kLogger.Debug(std::format("No more entries in directory: {}",
-                                   std::string_view(dir_->Entry.d_name, dir_->Entry.d_namlen)));
-        } else {
-          kLogger.Debug("No more entries in the root directory.");
-        }
 
         break;
       }
@@ -74,7 +66,6 @@ public:
           }
           DIR* new_dir_handle = fdopendir(dir_fd);
 
-          kLogger.Debug(std::format("Found directory: {}", entry_name));
           worker.GetScheduler()->Submit(TraverseDirectoryJob(dir, new_dir_handle));
           continue;
         }

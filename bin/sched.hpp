@@ -55,7 +55,6 @@ class Scheduler {
   }
 
   constexpr void Run() {
-    kLogger.Info(std::format("Starting scheduler with {} threads.", threadCount_));
     for (std::uint16_t i = 0; i < threadCount_; ++i) {
       isWorking_[i].store(true, std::memory_order_relaxed);
     }
@@ -132,13 +131,10 @@ constexpr void Worker<Scheduler>::Run() {
     }
 
     if (work_count == 0) {
-      kLogger.Info(std::format("Worker {} is idle, quitting...", std::this_thread::get_id()));
       break;
     }
 
     auto maybe_job = GetJob();
-    kLogger.Debug(
-        std::format("Worker {} got job: {}", std::this_thread::get_id(), maybe_job.HasValue()));
     if (!maybe_job.HasValue()) {
       work_count--;
       continue;

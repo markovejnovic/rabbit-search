@@ -15,12 +15,6 @@ class Logger final {
     std::cerr << "[" << name_ << "] Error: " << message << '\n';
   }
 
-  template <class StringT>
-  constexpr void Info(const StringT& message) const noexcept {}
-
-  template <class StringT>
-  constexpr void Debug(const StringT& message) const noexcept {}
-
  private:
   const char* name_;
 };

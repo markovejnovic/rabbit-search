@@ -33,7 +33,6 @@ public:
     }
 
     if (file_stat.st_size == 0) {
-      kLogger.Debug(std::format("File {} is empty, skipping.", std::string_view{fsNode_->Entry.d_name, fsNode_->Entry.d_namlen}));
       return;
     }
 

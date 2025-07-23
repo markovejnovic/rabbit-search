@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <format>
 #include <iostream>
 #include <span>
@@ -11,7 +12,21 @@ namespace rbs {
 
 namespace {
 
+[[maybe_unused]] constexpr auto printResult(std::optional<Result>&& result,
+                                            std::span<char> path_buf) -> bool {
+  if (!result.has_value()) {
+    return false;
+  }
+
+  const std::string_view path = result->ComputePathStr(path_buf, '\n');
+  std::fwrite(path.data(), sizeof(char), path.size(), stdout);
+  return true;
+}
+
 auto Main(std::span<char*> args) -> int {
+  static constexpr std::size_t kMaxPath = 4096ULL * 4ULL;
+  std::array<char, kMaxPath> path_buf;
+
   CliArgs cli_args{args};
 
   Scheduler scheduler{cli_args.Jobs(), cli_args.SearchString()};
@@ -25,20 +40,11 @@ auto Main(std::span<char*> args) -> int {
       break;
     }
 
-    auto result = scheduler.GetResult(consumer_token);
-    if (result.has_value()) {
-      std::cout << "Found a result: " << result->Name() << '\n';
-    }
+    printResult(scheduler.GetResult(consumer_token), path_buf);
   }
 
   // Don't forget to flush any remaining results.
-  while (true) {
-    auto result = scheduler.GetResult(consumer_token);
-    if (!result.has_value()) {
-      break;
-    }
-    std::cout << "Found a result: " << result->Name() << '\n';
-  }
+  while (printResult(scheduler.GetResult(consumer_token), path_buf)) {}
 
   return 0;
 }
