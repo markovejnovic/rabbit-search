@@ -1,10 +1,10 @@
 #ifndef RBS_SCHED_HPP
 #define RBS_SCHED_HPP
 
-#include <array>
+#include <pthread.h>
+#include <sys/_pthread/_pthread_t.h>
 #include <cstdint>
-#include <format>
-#include <iostream>
+#include <ranges>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -17,6 +17,9 @@
 #include "worker.hpp"
 
 namespace rbs {
+
+template <class WorkerType>
+constexpr auto workerThreadEntry(void* arg) -> void*;
 
 template <class Allocator = std::allocator<std::byte>>
 class Scheduler {
@@ -41,11 +44,21 @@ class Scheduler {
   constexpr auto operator=(const Scheduler&) -> Scheduler& = delete;
   constexpr auto operator=(Scheduler&&) -> Scheduler& = delete;
 
-  constexpr ~Scheduler() { WaitForAll(); }
+  constexpr ~Scheduler() {
+    WaitForAll();
+
+    for (auto* worker : workerObjects_) {
+      delete worker;
+    }
+  }
 
   constexpr void WaitForAll() noexcept {
     for (auto& worker : workers_) {
-      worker.join();
+      const int err = pthread_join(worker, nullptr);
+      if (err != 0) [[unlikely]] {
+        std::cerr << "Failed to join worker thread: " << std::strerror(err) << '\n';
+        std::terminate();
+      }
     }
   }
 
@@ -55,27 +68,43 @@ class Scheduler {
   }
 
   constexpr void Run() {
-    for (std::uint16_t i = 0; i < threadCount_; ++i) {
-      isWorking_[i].store(true, std::memory_order_relaxed);
-    }
-
+    workerObjects_.reserve(threadCount_);
     workers_.reserve(threadCount_);
+
     for (std::uint16_t i = 0; i < threadCount_; ++i) {
-      workers_.emplace(workers_.begin() + i,
-                       std::thread([](WorkerType&& worker) { worker.Run(); },
-                                   WorkerType(this, moodycamel::ProducerToken(jobQueue_),
-                                              moodycamel::ConsumerToken(jobQueue_),
-                                              moodycamel::ProducerToken(resultQueue_),
-                                              &fsNodeArena_, &isWorking_[i])));
+      auto job_prod = moodycamel::ProducerToken(jobQueue_);
+      auto job_cons = moodycamel::ConsumerToken(jobQueue_);
+      auto result_prod = moodycamel::ProducerToken(resultQueue_);
+
+      workerObjects_.emplace(workerObjects_.begin() + i,
+                             new WorkerType(this, std::move(job_prod), std::move(job_cons),
+                                            std::move(result_prod), &fsNodeArena_));
+      workers_.emplace(workers_.begin() + i, pthread_t{});
+      const int error_num = pthread_create(&workers_[i], nullptr, &workerThreadEntry<WorkerType>,
+                                           static_cast<void*>(workerObjects_[i]));
+
+      if (error_num != 0) [[unlikely]] {
+        std::cerr << "Failed to create worker thread: " << std::strerror(errno) << '\n';
+        std::terminate();
+      }
     }
   }
 
   [[nodiscard]] constexpr auto IsBusy() const -> bool {
-    return std::ranges::any_of(isWorking_, [](const std::atomic<bool>& working) {
-      return working.load(std::memory_order_relaxed);
-    });
+    auto working = std::views::transform(
+        workerObjects_, [](const WorkerType* worker) { return worker->IsWorking(); });
 
-    return false;
+    return std::ranges::any_of(working, [](bool is_working) { return is_working; });
+  }
+
+  constexpr void Submit(TraverseDirectoryJob&& job) {
+    dirsOpen_.fetch_add(1, std::memory_order_relaxed);
+    const bool enqueue_result = jobQueue_.enqueue(MaybeJob(job));
+    assert(enqueue_result && "Failed to enqueue job. This is a bug.");
+  }
+
+  [[nodiscard]] constexpr auto DirectoriesCurrentlyOpen() -> std::uint16_t {
+    return dirsOpen_.load(std::memory_order_relaxed);
   }
 
   constexpr void Submit(MaybeJob&& job) {
@@ -105,11 +134,9 @@ class Scheduler {
   Allocator allocator_;
   std::uint16_t threadCount_;
   // TODO(marko): Share allocator with this vector.
-  std::vector<std::thread> workers_;
+  std::vector<pthread_t> workers_;
 
-  // TODO(marko): Get rid of this array and pack it with the workers.
-  // NOLINTNEXTLINE(readability-magic-numbers)
-  std::array<std::atomic<bool>, 64> isWorking_;
+  std::vector<WorkerType*> workerObjects_;
 
   // Note that MaybeJob::None will never be emplaced in this queue.
   moodycamel::ConcurrentQueue<MaybeJob> jobQueue_;
@@ -119,32 +146,34 @@ class Scheduler {
   std::string_view searchString_;
 
   std::atomic<bool> exit_signal_{false};
+
+  std::atomic<std::uint16_t> dirsOpen_{0};
 };
 
 template <class Scheduler>
 constexpr void Worker<Scheduler>::Run() {
-  std::uint16_t work_count = kWorkCountLeakyBucketInitialValue;
-
   while (true) {
     if (scheduler_->exit_signal_.load(std::memory_order_relaxed)) {
       break;
     }
 
-    if (work_count == 0) {
+    const std::uint16_t directories_currently_open = scheduler_->DirectoriesCurrentlyOpen();
+    if (directories_currently_open == 0) {
+      // If no directories are currently open, we need to flush the queue of jobs and exit.
+      MaybeJob job = MaybeJob::None();
+      while ((job = GetJob()).HasValue()) {
+        job.Service(*this);
+      }
+
+      // After flushing out the queue, we can exit this thread.
       break;
     }
 
-    auto maybe_job = GetJob();
-    if (!maybe_job.HasValue()) {
-      work_count--;
-      continue;
+    MaybeJob job = GetJob();
+    if (job.HasValue()) {
+      job.Service(*this);
     }
-
-    maybe_job.Service(*this);
-    work_count += kWorkCountLeakyBucketGain;
   }
-
-  isWorking_->store(false, std::memory_order_relaxed);
 }
 
 template <class Scheduler>
@@ -152,6 +181,13 @@ constexpr auto Worker<Scheduler>::GetJob() noexcept -> MaybeJob {
   MaybeJob job = MaybeJob::None();
   scheduler_->jobQueue_.try_dequeue(consumerToken_, job);
   return job;
+}
+
+template <>
+constexpr auto workerThreadEntry<Worker<Scheduler<std::allocator<std::byte>>>>(void* arg) -> void* {
+  auto* worker = static_cast<Worker<Scheduler<std::allocator<std::byte>>>*>(arg);
+  worker->Run();
+  return nullptr;
 }
 
 }  // namespace rbs

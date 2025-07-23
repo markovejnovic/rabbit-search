@@ -49,13 +49,12 @@ struct MaybeJob {
     return MaybeJob{detail::NopJob()};
   }
 
-  // NOLINTBEGIN(google-explicit-constructor)
-  constexpr MaybeJob(TraverseDirectoryJob job) noexcept
+  explicit constexpr MaybeJob(TraverseDirectoryJob job) noexcept
       : type_(detail::JobType::kTraverseDirectory), payload_({.traverseDirectoryJob_ = job}) {}
 
+  // NOLINTNEXTLINE(google-explicit-constructor)
   constexpr MaybeJob(SearchFileJob job) noexcept
       : type_(detail::JobType::kSearchFile), payload_({.searchFileJob_ = job}) {}
-  // NOLINTEND(google-explicit-constructor)
 
 private:
   explicit constexpr MaybeJob(detail::NopJob job) noexcept

@@ -17,16 +17,14 @@ class Worker {
   static constexpr Logger kLogger{"Worker"};
 
  public:
-  explicit constexpr Worker(Scheduler* scheduler, moodycamel::ProducerToken producerToken,
-                            moodycamel::ConsumerToken consumerToken,
-                            moodycamel::ProducerToken resultProducerToken,
-                            alloc::MPArena<FsNode>* directoryArena,
-                            std::atomic<bool>* isWorking) noexcept
+  explicit constexpr Worker(Scheduler* scheduler, moodycamel::ProducerToken&& producerToken,
+                            moodycamel::ConsumerToken&& consumerToken,
+                            moodycamel::ProducerToken&& resultProducerToken,
+                            alloc::MPArena<FsNode>* directoryArena) noexcept
       : scheduler_(scheduler),
         producerToken_(std::move(producerToken)),
         consumerToken_(std::move(consumerToken)),
         resultProducerToken_(std::move(resultProducerToken)),
-        isWorking_(isWorking),
         fsNodeArena_(directoryArena) {}
 
   constexpr Worker(const Worker&) = delete;
@@ -56,10 +54,6 @@ class Worker {
     return producerToken_;
   }
 
-  [[nodiscard]] constexpr auto ConsumerToken() noexcept -> moodycamel::ConsumerToken& {
-    return consumerToken_;
-  }
-
   [[nodiscard]] constexpr auto SearchString() const noexcept -> std::string_view {
     return scheduler_->searchString_;
   }
@@ -72,6 +66,14 @@ class Worker {
     scheduler_->resultQueue_.enqueue(resultProducerToken_, std::move(result));
   }
 
+  [[nodiscard]] constexpr auto IsWorking() const noexcept -> bool {
+    return scheduler_->DirectoriesCurrentlyOpen() > 0;
+  }
+
+  constexpr void FinishTraversingDirectory() noexcept {
+    scheduler_->dirsOpen_.fetch_sub(1, std::memory_order_relaxed);
+  }
+
   constexpr void Run();
 
  private:
@@ -81,8 +83,6 @@ class Worker {
   moodycamel::ProducerToken producerToken_;
   moodycamel::ConsumerToken consumerToken_;
   moodycamel::ProducerToken resultProducerToken_;
-
-  std::atomic<bool>* isWorking_;
 };
 
 }  // namespace rbs

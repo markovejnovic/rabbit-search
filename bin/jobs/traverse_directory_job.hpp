@@ -69,6 +69,11 @@ public:
           worker.GetScheduler()->Submit(TraverseDirectoryJob(dir, new_dir_handle));
           continue;
         }
+        case DT_LNK: {
+          // We ignore symbolic links for now.
+          // TODO(marko): Implement symbolic link following.
+          continue;
+        }
         case DT_REG: {
           // We found a regular file that we can search in.
           const int file_fd = openat(dirfd(dirHandle_), dir->Entry.d_name, O_RDONLY);
@@ -91,6 +96,7 @@ public:
     }
 
     closedir(dirHandle_);
+    worker.FinishTraversingDirectory();
   }
 
   [[nodiscard]] static constexpr auto FromPath(

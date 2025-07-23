@@ -1,14 +1,21 @@
 cmake_minimum_required(VERSION 3.28)
 project(rbs LANGUAGES CXX)
 
+option(RBS_USE_MIMALLOC "Use mimalloc for memory allocation" ON)
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(CMAKE_CLANG_TIDY "clang-tidy;-checks=*")
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-  set(SANITIZER_FLAGS "-fsanitize=address,undefined" "-fno-omit-frame-pointer")
+  set(SANITIZER_FLAGS "")
 else()
   set(SANITIZER_FLAGS "")
+endif()
+if (RBS_PROFILE_MODE)
+  set(PROFILE_FLAGS "-fno-inline")
+else()
+  set(PROFILE_FLAGS "")
 endif()
 
 include(FetchContent)
@@ -25,15 +32,35 @@ FetchContent_Declare(
   QUIET GIT_REPOSITORY https://github.com/ashvardanian/stringzilla.git
   GIT_TAG v3.12.5
 )
-
 FetchContent_MakeAvailable(concurrentqueue_proj)
 FetchContent_MakeAvailable(stringzilla)
 
-include(CheckCXXCompilerFlag)
-CHECK_CXX_COMPILER_FLAG("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
-if(COMPILER_SUPPORTS_MARCH_NATIVE)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
+if (RBS_USE_MIMALLOC)
+  FetchContent_Declare(
+    mimalloc
+    QUIET GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+    GIT_TAG v3.0.8
+  )
+
+  FetchContent_MakeAvailable(mimalloc)
+
+  set(RBS_MIMALLOC_LIB mimalloc-static)
+else()
+  set(RBS_MIMALLOC_LIB "")
 endif()
+
+include(CheckCXXCompilerFlag)
+string(APPEND CMAKE_CXX_FLAGS " -march=native")
+string(APPEND CMAKE_CXX_FLAGS " -fno-plt")
+string(APPEND CMAKE_CXX_FLAGS " -fno-rtti")
+string(APPEND CMAKE_CXX_FLAGS " -ffast-math")
+string(APPEND CMAKE_CXX_FLAGS " -fassociative-math")
+string(APPEND CMAKE_CXX_FLAGS " -finline-functions")
+string(APPEND CMAKE_CXX_FLAGS " -funroll-loops")
+string(APPEND CMAKE_CXX_FLAGS " -fomit-frame-pointer")
+string(APPEND CMAKE_CXX_FLAGS " -fno-math-errno")
+string(APPEND CMAKE_CXX_FLAGS " -fmerge-all-constants")
+string(APPEND CMAKE_CXX_FLAGS " -fno-stack-protector")
 
 set(RBS_SOURCE_FILES
   bin/rbs.cpp
@@ -51,9 +78,9 @@ target_include_directories(rbs PRIVATE
 )
 
 # Use same sanitizer flags for the test
-target_compile_options(rbs PRIVATE ${SANITIZER_FLAGS})
+target_compile_options(rbs PRIVATE ${SANITIZER_FLAGS} ${PROFILE_FLAGS})
 target_link_options(rbs PRIVATE ${SANITIZER_FLAGS})
-target_link_libraries(rbs PRIVATE concurrentqueue stringzilla)
+target_link_libraries(rbs PRIVATE concurrentqueue stringzilla ${RBS_MIMALLOC_LIB})
 
 if (DEFINED RBS_CLANG_TIDY)
   set(clang_tidy_outputs)
